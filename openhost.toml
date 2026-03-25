@@ -1,0 +1,22 @@
+[app]
+name = "synapse"
+version = "0.1.0"
+description = "Matrix Synapse homeserver - decentralized, encrypted communication"
+
+[runtime.container]
+image = "Dockerfile"
+port = 3000
+
+[routing]
+public_paths = [
+    "/_matrix/",
+    "/_synapse/client/",
+    "/.well-known/matrix/",
+]
+
+[resources]
+memory_mb = 512
+cpu_millicores = 500
+
+[data]
+app_data = true
