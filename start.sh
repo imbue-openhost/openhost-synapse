@@ -79,6 +79,24 @@ else
     fi
 fi
 
+# Always ensure relaxed rate limits (small personal server)
+if ! grep -q "^rc_login:" /data/homeserver.yaml; then
+    cat >> /data/homeserver.yaml <<EOF
+
+# Relaxed rate limits for personal server
+rc_login:
+  address:
+    per_second: 10
+    burst_count: 50
+  account:
+    per_second: 10
+    burst_count: 50
+  failed_attempts:
+    per_second: 10
+    burst_count: 50
+EOF
+fi
+
 # Fix ownership for the synapse user (UID 991)
 chown -R 991:991 /data 2>/dev/null || true
 
