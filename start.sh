@@ -71,14 +71,6 @@ enable_registration_without_verification: true
 suppress_key_server_warning: true
 EOF
 
-    # Ensure the default listener serves federation (not just client).
-    # Synapse's generated config uses "client, federation" by default, but
-    # verify it's there so federation works even if upstream changes defaults.
-    if ! grep -q "federation" /data/homeserver.yaml; then
-        echo "WARNING: federation not found in listeners config, adding it"
-        sed -i 's/\- names: \[client\]/- names: [client, federation]/' /data/homeserver.yaml
-    fi
-
     echo "Config generated successfully"
 else
     echo "Existing config found, updating public_baseurl"
@@ -86,6 +78,14 @@ else
     if grep -q "^public_baseurl:" /data/homeserver.yaml; then
         sed -i "s|^public_baseurl:.*|public_baseurl: \"$PUBLIC_BASEURL\"|" /data/homeserver.yaml
     fi
+fi
+
+# Ensure the listener serves federation (not just client) on every boot.
+# Synapse's generated config uses "client, federation" by default, but
+# verify it's there so federation works even on existing deployments.
+if ! grep -q "federation" /data/homeserver.yaml; then
+    echo "WARNING: federation not found in listeners config, adding it"
+    sed -i 's/\- names: \[client\]/- names: [client, federation]/' /data/homeserver.yaml
 fi
 
 # Always ensure relaxed rate limits (small personal server)
