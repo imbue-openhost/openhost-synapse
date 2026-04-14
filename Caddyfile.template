@@ -1,0 +1,28 @@
+{
+	auto_https off
+}
+
+:3000 {
+	# Serve .well-known responses for Matrix federation and client discovery.
+	handle /.well-known/matrix/server {
+		header Content-Type application/json
+		header Access-Control-Allow-Origin *
+		respond `{"m.server":"SERVER_NAME_PLACEHOLDER:443"}`
+	}
+
+	handle /.well-known/matrix/client {
+		header Content-Type application/json
+		header Access-Control-Allow-Origin *
+		respond `{"m.homeserver":{"base_url":"PUBLIC_BASEURL_PLACEHOLDER"}}`
+	}
+
+	# Proxy everything else to Synapse (client-server + federation APIs).
+	handle {
+		reverse_proxy localhost:8008 {
+			# Rewrite the Host header from X-Forwarded-Host so that Synapse
+			# sees the correct origin. The OpenHost router strips Host and
+			# puts the real value in X-Forwarded-Host.
+			header_up Host {header.X-Forwarded-Host}
+		}
+	}
+}

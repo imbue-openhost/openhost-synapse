@@ -61,7 +61,7 @@ if [ ! -f /data/homeserver.yaml ]; then
 
     /start.py generate
 
-    # Patch the generated config with OpenHost-friendly defaults
+    # Patch the generated config with OpenHost-friendly defaults.
     cat >> /data/homeserver.yaml <<EOF
 
 # OpenHost overrides
@@ -70,6 +70,15 @@ enable_registration: true
 enable_registration_without_verification: true
 suppress_key_server_warning: true
 EOF
+
+    # Ensure the default listener serves federation (not just client).
+    # Synapse's generated config uses "client, federation" by default, but
+    # verify it's there so federation works even if upstream changes defaults.
+    if ! grep -q "federation" /data/homeserver.yaml; then
+        echo "WARNING: federation not found in listeners config, adding it"
+        sed -i 's/\- names: \[client\]/- names: [client, federation]/' /data/homeserver.yaml
+    fi
+
     echo "Config generated successfully"
 else
     echo "Existing config found, updating public_baseurl"
@@ -97,11 +106,18 @@ rc_login:
 EOF
 fi
 
+# Generate Caddyfile from template with .well-known responses for federation.
+# Caddy serves these directly so other homeservers can discover this server.
+sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
+    -e "s|PUBLIC_BASEURL_PLACEHOLDER|${PUBLIC_BASEURL}|g" \
+    /app/Caddyfile.template > /app/Caddyfile
+echo "well-known: server=${SERVER_NAME}:443 client_base=${PUBLIC_BASEURL}"
+
 # Fix ownership for the synapse user (UID 991)
 chown -R 991:991 /data 2>/dev/null || true
 
-# Start Caddy in background — it rewrites Host from X-Forwarded-Host on
-# port 3000, then proxies to Synapse on port 8008.
+# Start Caddy in background — it serves .well-known, rewrites Host from
+# X-Forwarded-Host, and proxies to Synapse on port 8008.
 caddy run --config /app/Caddyfile &
 CADDY_PID=$!
 echo "Caddy started (PID $CADDY_PID)"

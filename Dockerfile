@@ -7,9 +7,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends caddy && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy our startup wrapper and Caddyfile
+# Copy our startup wrapper and Caddyfile template
 COPY start.sh /app/start.sh
-COPY Caddyfile /app/Caddyfile
+COPY Caddyfile.template /app/Caddyfile.template
 RUN chmod +x /app/start.sh
 
 EXPOSE 3000
