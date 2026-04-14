@@ -82,14 +82,19 @@ fi
 export SYNAPSE_SERVER_NAME="$SERVER_NAME"
 export SYNAPSE_REPORT_STATS="no"
 
+# Tell upstream start.py to run Synapse as UID/GID 1000 (host user) instead
+# of the default 991, so persistent data ownership stays consistent.
+export UID=1000
+export GID=1000
+
 echo "Synapse starting: server_name=$SERVER_NAME public_baseurl=$PUBLIC_BASEURL data_dir=$DATA_DIR"
 
 # Generate config on first boot if homeserver.yaml doesn't exist
 if [ ! -f "$DATA_DIR/homeserver.yaml" ]; then
     echo "First boot: generating Synapse config for server name: $SERVER_NAME"
 
-    # Ensure ownership before generate (it runs as uid 991 via gosu)
-    chown -R 991:991 "$DATA_DIR" 2>/dev/null || true
+    # Ensure ownership before generate (it runs as uid 1000 via gosu)
+    chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
 
     /start.py generate
 
@@ -175,8 +180,8 @@ sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
     /app/Caddyfile.template > /app/Caddyfile
 echo "well-known: server=${SERVER_NAME}:443 client_base=${PUBLIC_BASEURL}"
 
-# Fix ownership for the synapse user (UID 991)
-chown -R 991:991 "$DATA_DIR" 2>/dev/null || true
+# Fix ownership for the host user (UID 1000)
+chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
 
 # Start Caddy in background — it serves .well-known, rewrites Host from
 # X-Forwarded-Host, and proxies to Synapse on port 8008.

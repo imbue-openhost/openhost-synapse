@@ -5,7 +5,9 @@ FROM matrixdotorg/synapse:latest
 # and sets X-Forwarded-Host; Synapse needs them to match for correct URLs).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends caddy && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    groupadd -g 1000 host && \
+    useradd -u 1000 -g 1000 -m host
 
 # Copy our startup wrapper and Caddyfile template
 COPY start.sh /app/start.sh
