@@ -3,13 +3,8 @@
 }
 
 :3000 {
-	# Serve .well-known responses for Matrix federation and client discovery.
-	handle /.well-known/matrix/server {
-		header Content-Type application/json
-		header Access-Control-Allow-Origin *
-		respond `{"m.server":"SERVER_NAME_PLACEHOLDER:443"}`
-	}
-
+	# Serve .well-known response for Matrix client discovery.
+	# Federation is disabled — no .well-known/matrix/server endpoint.
 	handle /.well-known/matrix/client {
 		header Content-Type application/json
 		header Access-Control-Allow-Origin *
