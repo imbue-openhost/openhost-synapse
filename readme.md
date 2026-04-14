@@ -1,6 +1,6 @@
 Matrix Synapse homeserver for OpenHost with federation support. Runs as a single Docker container:
 
-- Synapse latest (Matrix homeserver for decentralized, end-to-end encrypted communication)
+- Synapse latest (Matrix homeserver for federated, end-to-end encrypted communication)
 - Federation enabled out of the box via `.well-known` delegation
 - SQLite database (no external database required)
 - Persistent data in OpenHost's app_data directory
