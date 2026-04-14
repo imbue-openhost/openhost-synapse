@@ -139,12 +139,20 @@ else
     fi
 fi
 
-# Ensure the listener serves federation (not just client) on every boot.
-# Synapse's generated config uses "client, federation" by default, but
-# verify it's there so federation works even on existing deployments.
-if ! grep -q "federation" "$DATA_DIR/homeserver.yaml"; then
-    echo "WARNING: federation not found in listeners config, adding it"
-    sed -i 's/\- names: \[client\]/- names: [client, federation]/' "$DATA_DIR/homeserver.yaml"
+# Remove federation from listeners — this is a personal server, federation
+# adds complexity without much benefit.  Only serve the client API.
+if grep -q "client, federation" "$DATA_DIR/homeserver.yaml"; then
+    echo "Disabling federation listener"
+    sed -i 's/\- names: \[client, federation\]/- names: [client]/' "$DATA_DIR/homeserver.yaml"
+fi
+
+# Block all federation with an empty domain whitelist (on every boot)
+if ! grep -q "^federation_domain_whitelist:" "$DATA_DIR/homeserver.yaml"; then
+    cat >> "$DATA_DIR/homeserver.yaml" <<EOF
+
+# Federation disabled — personal server, no need for cross-server communication.
+federation_domain_whitelist: []
+EOF
 fi
 
 # Always ensure relaxed rate limits (small personal server)
@@ -173,12 +181,11 @@ if grep -q "^database:" "$DATA_DIR/homeserver.yaml"; then
     fi
 fi
 
-# Generate Caddyfile from template with .well-known responses for federation.
-# Caddy serves these directly so other homeservers can discover this server.
+# Generate Caddyfile from template with .well-known client discovery.
 sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
     -e "s|PUBLIC_BASEURL_PLACEHOLDER|${PUBLIC_BASEURL}|g" \
     /app/Caddyfile.template > /app/Caddyfile
-echo "well-known: server=${SERVER_NAME}:443 client_base=${PUBLIC_BASEURL}"
+echo "well-known: client_base=${PUBLIC_BASEURL} (federation disabled)"
 
 # Fix ownership for the host user (UID 1000)
 chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
