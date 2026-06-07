@@ -29,7 +29,7 @@ The UI has two toggles:
 - **Open Registration** — allow anyone to create an account without an invitation
 - **Federation** — allow this server to communicate with other Matrix homeservers
 
-On save, the admin UI updates `openhost_settings.json`, patches `homeserver.yaml`, and sends `SIGHUP` to Synapse to reload configuration. Most settings take effect immediately without a full restart.
+On save, the admin UI updates `openhost_settings.json` and patches `homeserver.yaml`. A restart of the app is required for the changes to take effect (Synapse's SIGHUP only reloads log config, not registration or federation settings).
 
 Settings are stored in `$OPENHOST_APP_DATA_DIR/openhost_settings.json`:
 ```json

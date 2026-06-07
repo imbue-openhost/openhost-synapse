@@ -387,7 +387,7 @@ def save():
     return render_template_string(
         TEMPLATE,
         settings=settings,
-        message="Settings saved and applied." if reloaded else None,
+        message="Settings saved. Restart the app to apply changes." if reloaded else None,
         warning=warning,
     )
 
