@@ -437,6 +437,20 @@ except OSError as e:
 content = re.sub(r'(?m)^matrix_authentication_service:\n(?:[ \t]+[^\n]*\n)*', '', content)
 content = re.sub(r'\n{3,}', '\n\n', content)
 
+# When MAS is enabled, Synapse MUST have enable_registration: false and
+# enable_registration_without_verification: false — MAS handles all registration.
+# This overrides the openhost_settings.json value for these Synapse-side keys.
+def set_yaml_bool(content, key, value):
+    val = "true" if value else "false"
+    pattern = re.compile(rf"^{re.escape(key)}:.*$", re.MULTILINE)
+    replacement = f"{key}: {val}"
+    if pattern.search(content):
+        return pattern.sub(replacement, content)
+    return content.rstrip() + f"\n{replacement}\n"
+
+content = set_yaml_bool(content, "enable_registration", False)
+content = set_yaml_bool(content, "enable_registration_without_verification", False)
+
 # Add MAS integration block
 mas_block = f"""matrix_authentication_service:
   enabled: true
@@ -447,7 +461,7 @@ content = content.rstrip() + "\n" + mas_block
 
 with open(yaml_path, "w") as f:
     f.write(content)
-print("Synapse homeserver.yaml patched for MAS integration")
+print("Synapse homeserver.yaml patched for MAS integration (registration delegated to MAS)")
 MASPY
 
     # Run MAS database migrations

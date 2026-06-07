@@ -45,7 +45,8 @@ templates:
   assets_manifest: /usr/local/share/mas-cli/manifest.json
   translations_path: /usr/local/share/mas-cli/translations/
 
-upstream_oauth2: {}
+upstream_oauth2:
+  providers: []
 
 email:
   from: '"Synapse Server" <noreply@SERVER_NAME_PLACEHOLDER>'
