@@ -238,26 +238,41 @@ func (c *Client) PromoteUser(userID string, admin bool) error {
 	return err
 }
 
-// ListUserSessions returns active sessions for a user.
-func (c *Client) ListUserSessions(userID string) ([]map[string]interface{}, error) {
+// DeviceSession represents a single session for a device from the whois endpoint.
+type DeviceSession struct {
+	IPAddr    string `json:"ip"`
+	UserAgent string `json:"user_agent"`
+	LastSeen  int64  `json:"last_seen"`
+}
+
+// DeviceInfo holds device-level session info from the whois endpoint.
+type DeviceInfo struct {
+	DeviceID string          `json:"-"`
+	Sessions []DeviceSession `json:"sessions"`
+}
+
+// ListUserDevices returns device and session info for a user via the /whois endpoint.
+func (c *Client) ListUserDevices(userID string) ([]DeviceInfo, error) {
 	data, err := c.get(adminPathV1 + "/whois/" + url.PathEscape(userID))
 	if err != nil {
 		return nil, err
 	}
+
+	// Response shape: {"user_id": "...", "devices": {"deviceId": {"sessions": [...]}}}
 	var resp struct {
-		Devices map[string]interface{} `json:"devices"`
+		Devices map[string]struct {
+			Sessions []DeviceSession `json:"sessions"`
+		} `json:"devices"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, err
 	}
-	// Flatten into a slice for display
-	var sessions []map[string]interface{}
-	for _, v := range resp.Devices {
-		if m, ok := v.(map[string]interface{}); ok {
-			sessions = append(sessions, m)
-		}
+
+	devices := make([]DeviceInfo, 0, len(resp.Devices))
+	for id, d := range resp.Devices {
+		devices = append(devices, DeviceInfo{DeviceID: id, Sessions: d.Sessions})
 	}
-	return sessions, nil
+	return devices, nil
 }
 
 // DeleteUserMedia deletes all media uploaded by a user.
@@ -367,16 +382,35 @@ type Stats struct {
 	CacheSize      int `json:"cache_size"`
 }
 
-// GetStats fetches server statistics.
+// GetStats fetches server statistics by querying the user list (for count) and room list.
+// Note: Synapse has no single "server stats" endpoint; we derive counts from paginated list APIs.
 func (c *Client) GetStats() (*Stats, error) {
-	data, err := c.get(adminPathV1 + "/statistics/users/media")
-	if err != nil {
-		// Stats endpoint may not exist in older Synapse; return zeros
-		return &Stats{}, nil
+	s := &Stats{}
+
+	// Total users: the /v2/users endpoint returns a total field even with limit=1
+	usersData, err := c.get(adminPathV2 + "/users?limit=1&guests=false")
+	if err == nil {
+		var resp struct {
+			Total int `json:"total"`
+		}
+		if err := json.Unmarshal(usersData, &resp); err == nil {
+			s.TotalNonGuests = resp.Total
+			s.TotalUsers = resp.Total
+		}
 	}
-	var s Stats
-	_ = json.Unmarshal(data, &s)
-	return &s, nil
+
+	// Total rooms: same pattern
+	roomsData, err := c.get(adminPathV1 + "/rooms?limit=1")
+	if err == nil {
+		var resp struct {
+			TotalRooms int `json:"total_rooms"`
+		}
+		if err := json.Unmarshal(roomsData, &resp); err == nil {
+			s.TotalRooms = resp.TotalRooms
+		}
+	}
+
+	return s, nil
 }
 
 // ---- Registration tokens ----
@@ -437,10 +471,11 @@ func (c *Client) DeleteRegistrationToken(token string) error {
 
 // ---- Background jobs / purge ----
 
-// PurgeHistory purges old events from a room.
-func (c *Client) PurgeHistory(roomID, beforeEventID string, purgeRemoteEvents bool) (string, error) {
+// PurgeHistory purges old events from a room up to (but not including) beforeEventID.
+// If deleteLocalEvents is true, locally-originated events are also deleted.
+func (c *Client) PurgeHistory(roomID, beforeEventID string, deleteLocalEvents bool) (string, error) {
 	body := map[string]interface{}{
-		"delete_local_events": purgeRemoteEvents,
+		"delete_local_events": deleteLocalEvents,
 	}
 	if beforeEventID != "" {
 		body["purge_up_to_event_id"] = beforeEventID
