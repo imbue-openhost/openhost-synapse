@@ -44,7 +44,13 @@ func (h *handler) dashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 var statsTpl = template.Must(template.New("stats").Funcs(template.FuncMap{}).Parse(`
-{{if .Error}}
+{{if .Initializing}}
+<div class="stat-card" style="grid-column:1/-1;">
+  <div class="stat-label">Status</div>
+  <div class="stat-value" style="font-size:1rem;color:var(--warning)">Initializing…</div>
+  <p style="font-size:0.8rem;color:var(--text-faint);margin-top:0.5rem;">Synapse is starting up. The admin panel will be fully functional in a moment.</p>
+</div>
+{{else if .Error}}
 <div class="stat-card">
   <div class="stat-label">Status</div>
   <div class="stat-value" style="font-size:1rem;color:var(--error)">Unavailable</div>
@@ -67,10 +73,17 @@ var statsTpl = template.Must(template.New("stats").Funcs(template.FuncMap{}).Par
 
 func (h *handler) statsPartial(w http.ResponseWriter, r *http.Request) {
 	type statsData struct {
-		TotalUsers int
-		TotalRooms int
-		Version    string
-		Error      bool
+		TotalUsers  int
+		TotalRooms  int
+		Version     string
+		Error       bool
+		Initializing bool
+	}
+
+	// Check if Synapse is reachable yet
+	if !h.syn.IsReady() {
+		renderPartial(w, statsTpl, statsData{Initializing: true})
+		return
 	}
 
 	version, _ := h.syn.ServerVersion()

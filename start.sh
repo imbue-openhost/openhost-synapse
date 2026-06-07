@@ -327,6 +327,34 @@ ADMIN_PID=$!
 echo "Admin server started (PID $ADMIN_PID)"
 
 # ---------------------------------------------------------------------------
+# synapse_login PASSWORD: logs into Synapse as openhost-admin and prints the
+# access token to stdout. Credentials are passed via environment to avoid
+# exposing them in /proc/<pid>/cmdline.
+# ---------------------------------------------------------------------------
+synapse_login() {
+    ADMIN_PASS="$1" python3 << 'LOGINPY'
+import json, os, urllib.request, sys
+try:
+    pw = os.environ['ADMIN_PASS']
+    payload = json.dumps({
+        'type': 'm.login.password',
+        'user': 'openhost-admin',
+        'password': pw,
+    }).encode()
+    req = urllib.request.Request(
+        'http://127.0.0.1:8008/_matrix/client/v3/login',
+        data=payload,
+        headers={'Content-Type': 'application/json'}
+    )
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read())
+        print(data.get('access_token', ''))
+except Exception as e:
+    sys.stderr.write('synapse_login error: ' + str(e) + '\n')
+LOGINPY
+}
+
+# ---------------------------------------------------------------------------
 # Wait for Synapse to start, then provision an admin token for the admin UI.
 # This is done after Synapse is running so register_new_matrix_user works.
 # ---------------------------------------------------------------------------
@@ -340,6 +368,11 @@ provision_admin_token() {
         sleep 2
         ATTEMPTS=$((ATTEMPTS + 1))
     done
+
+    if [ $ATTEMPTS -ge 60 ]; then
+        echo "ERROR: Synapse did not start within 120s, skipping admin token provisioning"
+        return 1
+    fi
 
     if [ ! -f "$ADMIN_TOKEN_FILE" ] || [ ! -s "$ADMIN_TOKEN_FILE" ]; then
         echo "Provisioning admin token..."
@@ -378,27 +411,7 @@ if result.returncode != 0:
         sys.stderr.write('openhost-admin user already exists, skipping registration\n')
 REGPY
         # Log in to get an access token — pass password via env
-        TOKEN=$(ADMIN_PASS="$ADMIN_PASS" python3 << 'LOGINPY'
-import json, os, urllib.request, sys
-try:
-    pw = os.environ['ADMIN_PASS']
-    payload = json.dumps({
-        'type': 'm.login.password',
-        'user': 'openhost-admin',
-        'password': pw,
-    }).encode()
-    req = urllib.request.Request(
-        'http://127.0.0.1:8008/_matrix/client/v3/login',
-        data=payload,
-        headers={'Content-Type': 'application/json'}
-    )
-    with urllib.request.urlopen(req) as resp:
-        data = json.loads(resp.read())
-        print(data.get('access_token', ''))
-except Exception as e:
-    sys.stderr.write('login error: ' + str(e) + '\n')
-LOGINPY
-)
+        TOKEN=$(synapse_login "$ADMIN_PASS")
 
         if [ -n "$TOKEN" ]; then
             # Write with restricted permissions atomically to avoid TOCTOU race
@@ -415,36 +428,20 @@ LOGINPY
         EXISTING_TOKEN=$(cat "$ADMIN_TOKEN_FILE")
         HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer $EXISTING_TOKEN" \
-            "http://127.0.0.1:8008/_synapse/admin/v2/users?limit=1" 2>&1 || echo "000")
+            "http://127.0.0.1:8008/_synapse/admin/v2/users?limit=1" 2>/dev/null || echo "000")
         if [ "$HTTP_STATUS" != "200" ]; then
             echo "Admin token invalid (status $HTTP_STATUS), re-logging in..."
             STORED_PASS=$(cat "$DATA_DIR/admin_password" 2>/dev/null || echo "")
             if [ -n "$STORED_PASS" ]; then
-                TOKEN=$(ADMIN_PASS="$STORED_PASS" python3 << 'LOGINPY'
-import json, os, urllib.request, sys
-try:
-    pw = os.environ['ADMIN_PASS']
-    payload = json.dumps({
-        'type': 'm.login.password',
-        'user': 'openhost-admin',
-        'password': pw,
-    }).encode()
-    req = urllib.request.Request(
-        'http://127.0.0.1:8008/_matrix/client/v3/login',
-        data=payload,
-        headers={'Content-Type': 'application/json'}
-    )
-    with urllib.request.urlopen(req) as resp:
-        data = json.loads(resp.read())
-        print(data.get('access_token', ''))
-except Exception as e:
-    sys.stderr.write('login error: ' + str(e) + '\n')
-LOGINPY
-)
+                TOKEN=$(synapse_login "$STORED_PASS")
                 if [ -n "$TOKEN" ]; then
                     (umask 077; printf '%s' "$TOKEN" > "$ADMIN_TOKEN_FILE")
                     echo "Admin token refreshed"
+                else
+                    echo "Warning: could not refresh admin token"
                 fi
+            else
+                echo "Warning: no stored password, cannot refresh admin token"
             fi
         fi
     fi

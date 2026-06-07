@@ -5,37 +5,46 @@ Matrix Synapse homeserver for OpenHost. Runs as a single Docker container:
 - Open registration enabled by default (no email verification required)
 - SQLite database (no external database required)
 - Persistent data in OpenHost's app_data directory
-- Admin UI at `/_openhost/admin` for managing federation and registration
+- Admin UI at `/` and `/_openhost/admin` for managing all server settings
 
 ## How it works
 
 On first boot, the container:
 1. Generates a `homeserver.yaml` config with the server name derived from OpenHost environment variables (`<app_name>.<zone_domain>`, e.g. `synapse.andrew.host.imbue.com`)
 2. Generates signing keys
-3. Creates `openhost_settings.json` with default settings (federation disabled, open registration enabled)
+3. Creates `openhost_settings.json` with default settings
 4. Applies settings from `openhost_settings.json` to `homeserver.yaml`
-5. Appends relaxed rate limits suitable for a small personal server
-6. Generates a Caddyfile with a `.well-known/matrix/client` response for client auto-discovery
-7. Starts Caddy (serves well-known, routes admin UI, rewrites Host from X-Forwarded-Host, proxies to Synapse on port 8008), the admin UI, and Synapse
+5. Generates a Caddyfile routing `/` and `/_openhost/*` to the Go admin server, and Matrix APIs to Synapse
+6. Starts Caddy, the Go admin server, and Synapse in parallel
+7. Once Synapse is ready, provisions an `openhost-admin` user and stores its access token for the admin UI
 
 On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` and re-applies all settings from `openhost_settings.json`.
 
 ## Admin UI
 
-Settings for federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
+The admin UI is available at the root URL of the application (e.g. `https://synapse.andrew.host.imbue.com/`). It redirects to `/_openhost/admin`. All admin paths require OpenHost zone auth (owner-only).
 
-The UI has two toggles:
+The admin UI provides:
+- **Dashboard** — live stats (users, rooms, server version, uptime)
+- **Users** — list, search, create, deactivate, promote/demote admin, reset password, delete media
+- **Rooms** — list, search, delete (with purge)
+- **Registration Tokens** — create one-time or limited-use invite tokens (with expiry)
+- **Settings** — configure federation, registration, rate limits, password policy, upload size
 
-- **Open Registration** — allow anyone to create an account without an invitation
-- **Federation** — allow this server to communicate with other Matrix homeservers
-
-On save, the admin UI updates `openhost_settings.json` and patches `homeserver.yaml`. A restart of the app is required for the changes to take effect (Synapse's SIGHUP only reloads log config, not registration or federation settings).
+Changes are applied immediately via SIGHUP — no app restart required.
 
 Settings are stored in `$OPENHOST_APP_DATA_DIR/openhost_settings.json`:
 ```json
 {
   "federation_enabled": false,
-  "open_registration": true
+  "open_registration": true,
+  "rc_login_per_second": 10,
+  "rc_login_burst": 50,
+  "max_upload_size_mb": 50,
+  "password_min_length": 8,
+  "password_require_digit": false,
+  "password_require_symbol": false,
+  "allow_public_rooms": true
 }
 ```
 
@@ -46,17 +55,17 @@ Federation is **disabled** by default. The start script does two things to ensur
 1. Removes `federation` from the Synapse listener names (only the `client` API is served on port 8008)
 2. Appends `federation_domain_whitelist: []` to `homeserver.yaml`, which blocks all server-to-server communication
 
-The Caddyfile only serves `/.well-known/matrix/client` for client auto-discovery. There is no `/.well-known/matrix/server` endpoint. Port 8448 (the standard Matrix federation port) is not exposed.
+The Caddyfile serves `/.well-known/matrix/client` for client auto-discovery and `/.well-known/matrix/server` for federation discovery (needed when federation is enabled).
 
-To enable federation, use the admin UI at `/_openhost/admin`.
+To enable federation, use the admin UI Settings page.
 
 ## Registration
 
 Open registration is enabled by default. Anyone who can reach the Matrix client API can create an account without email verification.
 
-To disable registration, use the admin UI at `/_openhost/admin`.
+To disable registration or create invite tokens, use the admin UI.
 
-The first user to register can be promoted to admin via the Synapse admin API or by editing the database directly.
+An `openhost-admin` user is automatically created on first boot and used internally by the admin panel to call the Synapse Admin API.
 
 ## Deploying
 
@@ -74,14 +83,16 @@ Connect with any Matrix client (Element, FluffyChat, etc.) using your server URL
 
 All persistent data lives in `$OPENHOST_APP_DATA_DIR/`:
 - `homeserver.yaml` -- Synapse configuration (regenerated on first boot, patched on subsequent boots)
-- `openhost_settings.json` -- Admin UI settings (source of truth for federation and registration)
+- `openhost_settings.json` -- Admin UI settings (source of truth for all settings)
+- `admin_token` -- Access token for the openhost-admin user (used by the admin panel)
+- `admin_password` -- Password for the openhost-admin user (used for token refresh on restart)
 - `*.signing.key` -- Signing keys (back these up; losing them breaks room continuity)
 - `homeserver.db` -- SQLite database (users, rooms, messages, etc.)
 - `media_store/` -- Uploaded media and thumbnails
 
 ## Resources
 
-The `openhost.toml` requests 2048 MB RAM and 2 CPU cores. Synapse's memory usage grows with the number of joined rooms and active users. For a small personal server (a few users, limited rooms), the actual usage will be well under these limits.
+The `openhost.toml` requests 2048 MB RAM and 2 CPU cores. Synapse's memory usage grows with the number of joined rooms and active users.
 
 ## Public paths
 
@@ -90,29 +101,12 @@ The following paths are publicly accessible (no OpenHost zone auth required):
 - `/_synapse/client/` -- Synapse-specific client endpoints (registration, password reset)
 - `/.well-known/matrix/` -- Matrix client discovery
 
-All other paths (including `/_openhost/admin`) require OpenHost authentication.
-
-## Configuration
-
-`start.sh` auto-configures Synapse at runtime. Settings applied on first boot:
-- `server_name` derived from `OPENHOST_ZONE_DOMAIN` and `OPENHOST_APP_NAME`
-- `public_baseurl` set for correct URL generation
-- SQLite database at `$OPENHOST_APP_DATA_DIR/homeserver.db`
-- Relaxed rate limits (`rc_login` set to 10/s with burst of 50)
-
-Settings applied on every boot from `openhost_settings.json`:
-- `public_baseurl` (updated to match the current domain)
-- `media_store_path` (pointed at persistent storage)
-- Federation listener and `federation_domain_whitelist` (from `federation_enabled` setting)
-- `enable_registration` and `enable_registration_without_verification` (from `open_registration` setting)
-- Rate limits (appended if not present)
-
-To change federation or registration settings, use the admin UI. Direct edits to `homeserver.yaml` for these values will be overwritten on next boot.
+All other paths (including `/`, `/_openhost/admin`) require OpenHost authentication.
 
 ## Files
 
-- `Dockerfile` -- extends the official Synapse image with Caddy and Flask for the admin UI
-- `start.sh` -- generates config on first boot, applies settings from `openhost_settings.json` on every boot, starts Caddy, admin UI, and Synapse
-- `Caddyfile.template` -- Caddy config template; routes `/_openhost/admin` to the admin UI and proxies everything else to Synapse
-- `admin.py` -- Flask app serving the admin UI on port 8009
+- `Dockerfile` -- Multi-stage build: Go admin server + Synapse + Caddy (no Python Flask dependency)
+- `start.sh` -- Generates config on first boot, applies settings on every boot, starts Caddy, admin server, and Synapse
+- `Caddyfile.template` -- Routes `/` and `/_openhost/*` to the Go admin server; proxies Matrix APIs to Synapse
+- `admin/` -- Go HTTP server serving the admin UI on port 8009
 - `openhost.toml` -- OpenHost app manifest (2048 MB RAM, 2 CPU cores, app_data storage)
