@@ -331,21 +331,35 @@ chown postgres:postgres "$PG_DATA_DIR"
 # Keep $MAS_DIR root-owned but world-executable so postgres can traverse it
 chmod 755 "$MAS_DIR"
 
+# Find PostgreSQL binaries — on Debian they are versioned under /usr/lib/postgresql/XX/bin/
+PG_BIN=$(find /usr/lib/postgresql -name "initdb" -type f 2>/dev/null | sort -V | tail -1 | xargs dirname 2>/dev/null || echo "")
+if [ -z "$PG_BIN" ]; then
+    # Fallback to PATH
+    PG_BIN=$(dirname "$(which initdb 2>/dev/null)" 2>/dev/null || echo "/usr/bin")
+fi
+echo "PostgreSQL binaries: $PG_BIN"
+export PATH="$PG_BIN:$PATH"
+
 # Initialize PostgreSQL data directory (first boot only)
 if [ ! -f "$PG_DATA_DIR/PG_VERSION" ]; then
     echo "Initializing PostgreSQL for MAS..."
-    su -s /bin/sh postgres -c "initdb -D '$PG_DATA_DIR' --encoding=UTF8 --locale=C 2>&1"
-    echo "PostgreSQL initialized"
+    if ! su -s /bin/sh postgres -c "PATH='$PG_BIN:$PATH' initdb -D '$PG_DATA_DIR' --encoding=UTF8 --locale=C 2>&1"; then
+        echo "ERROR: PostgreSQL initdb failed — MAS will not be available"
+        SKIP_MAS=1
+    else
+        echo "PostgreSQL initialized"
+    fi
 fi
 
-# Start PostgreSQL with -w to wait for startup completion.
-# Store log inside pgdata so postgres can write to it without extra permission grants.
-echo "Starting PostgreSQL..."
-su -s /bin/sh postgres -c "pg_ctl -D '$PG_DATA_DIR' -l '$PG_LOG' start -w -o '-k /tmp'" 2>&1
-if [ $? -ne 0 ]; then
-    echo "ERROR: PostgreSQL failed to start — MAS will not be available"
-    # Continue without MAS rather than aborting Synapse startup
-    SKIP_MAS=1
+if [ -z "$SKIP_MAS" ]; then
+    # Start PostgreSQL with -w to wait for startup completion.
+    # Store log inside pgdata so postgres can write to it without extra permission grants.
+    echo "Starting PostgreSQL..."
+    if ! su -s /bin/sh postgres -c "PATH='$PG_BIN:$PATH' pg_ctl -D '$PG_DATA_DIR' -l '$PG_LOG' start -w -o '-k /tmp'" 2>&1; then
+        echo "ERROR: PostgreSQL failed to start — MAS will not be available"
+        # Continue without MAS rather than aborting Synapse startup
+        SKIP_MAS=1
+    fi
 fi
 
 if [ -z "$SKIP_MAS" ]; then
@@ -378,10 +392,11 @@ if [ -z "$SKIP_MAS" ]; then
 
     # Create PostgreSQL user and database for MAS (idempotent).
     # Use PGPASSWORD env var so the password never appears in psql's argv.
-    su -s /bin/sh postgres -c "psql -h /tmp -tAc \"SELECT 1 FROM pg_roles WHERE rolname='mas'\" | grep -q 1 || createuser -h /tmp mas" 2>/dev/null || true
-    MAS_DB_PASS="$MAS_DB_PASS" su -s /bin/sh postgres -c "
+    su -s /bin/sh postgres -c "PATH='$PG_BIN:$PATH' psql -h /tmp -tAc \"SELECT 1 FROM pg_roles WHERE rolname='mas'\" 2>/dev/null | grep -q 1 || PATH='$PG_BIN:$PATH' createuser -h /tmp mas 2>/dev/null" || true
+    MAS_DB_PASS="$MAS_DB_PASS" PG_BIN="$PG_BIN" su -s /bin/sh postgres -c "
+        PATH=\"\$PG_BIN:\$PATH\"
         psql -h /tmp -c \"ALTER USER mas WITH PASSWORD '\$MAS_DB_PASS';\" 2>/dev/null || true
-        psql -h /tmp -c \"SELECT 1 FROM pg_database WHERE datname='mas'\" | grep -q 1 || createdb -h /tmp -O mas mas 2>/dev/null || true
+        psql -h /tmp -tAc \"SELECT 1 FROM pg_database WHERE datname='mas'\" 2>/dev/null | grep -q 1 || createdb -h /tmp -O mas mas 2>/dev/null || true
     "
     echo "MAS PostgreSQL database ready"
 
