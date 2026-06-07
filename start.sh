@@ -602,9 +602,15 @@ def mas_issue_compat_token(username):
              '--yes-i-want-to-grant-synapse-admin-privileges'],
             capture_output=True, text=True, timeout=30
         )
+        sys.stderr.write(f'mas-cli stdout: {result.stdout!r}\n')
+        sys.stderr.write(f'mas-cli stderr: {result.stderr!r}\n')
+        sys.stderr.write(f'mas-cli returncode: {result.returncode}\n')
         if result.returncode == 0:
             # Output is the token on stdout
-            return result.stdout.strip()
+            token = result.stdout.strip()
+            if token:
+                return token
+            sys.stderr.write('mas-cli returned 0 but stdout is empty\n')
         else:
             sys.stderr.write(f'mas issue-compat-token error: {result.stderr}\n')
     except Exception as e:
