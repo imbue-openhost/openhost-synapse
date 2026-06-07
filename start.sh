@@ -179,31 +179,64 @@ fi
 
 # ---------------------------------------------------------------------------
 # Apply federation setting from openhost_settings.json
+# Use Python to reliably patch the YAML listener list and whitelist —
+# sed is fragile against Synapse's varied whitespace/quoting.
 # ---------------------------------------------------------------------------
-if [ "$FEDERATION_ENABLED" = "true" ]; then
-    # Re-enable federation listener if it was disabled
-    if grep -q "- names: \[client\]" "$DATA_DIR/homeserver.yaml"; then
-        echo "Enabling federation listener"
-        sed -i 's/- names: \[client\]/- names: [client, federation]/' "$DATA_DIR/homeserver.yaml"
-    fi
-    # Remove federation_domain_whitelist restriction
-    sed -i '/^# Federation disabled/d' "$DATA_DIR/homeserver.yaml"
-    sed -i '/^federation_domain_whitelist: \[\]/d' "$DATA_DIR/homeserver.yaml"
-else
-    # Disable federation listener
-    if grep -q "client, federation" "$DATA_DIR/homeserver.yaml"; then
-        echo "Disabling federation listener"
-        sed -i 's/\- names: \[client, federation\]/- names: [client]/' "$DATA_DIR/homeserver.yaml"
-    fi
-    # Block all federation with an empty domain whitelist
-    if ! grep -q "^federation_domain_whitelist:" "$DATA_DIR/homeserver.yaml"; then
-        cat >> "$DATA_DIR/homeserver.yaml" <<EOF
+python3 << PYEOF
+import re, sys
 
-# Federation disabled — personal server, no need for cross-server communication.
-federation_domain_whitelist: []
-EOF
-    fi
-fi
+path = "$DATA_DIR/homeserver.yaml"
+federation_enabled = "$FEDERATION_ENABLED" == "true"
+
+try:
+    content = open(path).read()
+except OSError as e:
+    sys.stderr.write(f"Warning: could not read homeserver.yaml: {e}\n")
+    sys.exit(0)
+
+# ---- Listener names ----
+# Synapse generates listeners with a "names" list. We need to add or remove
+# "federation" from that list. Handle both inline-list and multi-line formats.
+def set_federation_listener(content, enabled):
+    # Match "- names: [client]" or "- names: [client, federation]" (with optional spaces)
+    # Also handle "names: [client]" without leading dash (inside a list item)
+    def replace_names(m):
+        prefix = m.group(1)  # everything before the list
+        names_str = m.group(2)
+        # Parse the names
+        names = [n.strip().strip("'\"") for n in names_str.split(",")]
+        names = [n for n in names if n and n not in ("client", "federation")]
+        names = ["client"]
+        if enabled:
+            names = ["client", "federation"]
+        return prefix + "[" + ", ".join(names) + "]"
+
+    # Match inline list format: names: [client] or names: [client, federation]
+    pattern = r'((?:- )?names:\s*\[)(client(?:,\s*federation)?)\]'
+    new_content = re.sub(pattern, replace_names, content)
+    if new_content != content:
+        return new_content
+
+    # If no match found and federation_enabled, try to find listener block and ensure federation
+    return content
+
+content = set_federation_listener(content, federation_enabled)
+
+# ---- federation_domain_whitelist ----
+# Remove any existing whitelist lines (and their comments)
+content = re.sub(r'\n# Federation disabled[^\n]*\n', '\n', content)
+content = re.sub(r'^federation_domain_whitelist:.*$', '', content, flags=re.MULTILINE)
+content = re.sub(r'\n{3,}', '\n\n', content)  # collapse excess blank lines
+
+if not federation_enabled:
+    content = content.rstrip() + "\n\n# Federation disabled — personal server.\nfederation_domain_whitelist: []\n"
+
+open(path, "w").write(content)
+if federation_enabled:
+    print("Federation listener enabled, whitelist restriction removed")
+else:
+    print("Federation listener client-only, whitelist blocks all federation")
+PYEOF
 
 # ---------------------------------------------------------------------------
 # Apply registration setting from openhost_settings.json

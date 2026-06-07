@@ -64,49 +64,46 @@ def _set_yaml_bool(content: str, key: str, value: bool) -> str:
     return content.rstrip() + f"\n{replacement}\n"
 
 
+def _patch_federation_listener(content: str, enabled: bool) -> str:
+    """
+    Add or remove 'federation' from the Synapse listener names list.
+    Handles the inline-list format: names: [client] / names: [client, federation]
+    """
+    def replace_names(m: re.Match) -> str:
+        prefix = m.group(1)
+        return prefix + "[client, federation]" if enabled else prefix + "[client]"
+
+    # Match: (optional dash + spaces) names: [(client)(, federation)?]
+    pattern = r"((?:-\s+)?names:\s*\[)client(?:,\s*federation)?\]"
+    new = re.sub(pattern, replace_names, content)
+    return new
+
+
 def _set_federation_domain_whitelist(content: str, enabled: bool) -> str:
     """
-    When federation is disabled, set federation_domain_whitelist: []
+    When federation is disabled, ensure federation_domain_whitelist: []
     When enabled, remove the whitelist restriction entirely.
     """
-    pattern = r"^# Federation disabled.*\nfederation_domain_whitelist:.*$"
     pattern_simple = r"^federation_domain_whitelist:.*$"
 
-    if enabled:
-        # Remove any federation_domain_whitelist line (and its comment)
-        content = re.sub(
-            r"\n# Federation disabled[^\n]*\nfederation_domain_whitelist:[^\n]*",
-            "",
-            content,
-            flags=re.MULTILINE,
+    # Remove existing whitelist line and its preceding comment
+    content = re.sub(r"\n# Federation disabled[^\n]*\n", "\n", content)
+    content = re.sub(pattern_simple, "", content, flags=re.MULTILINE)
+    # Collapse excess blank lines
+    content = re.sub(r"\n{3,}", "\n\n", content)
+
+    if not enabled:
+        content = content.rstrip() + (
+            "\n\n# Federation disabled — personal server.\n"
+            "federation_domain_whitelist: []\n"
         )
-        content = re.sub(pattern_simple, "", content, flags=re.MULTILINE)
-        # Also re-enable the federation listener if it was removed
-        content = re.sub(
-            r"- names: \[client\]",
-            "- names: [client, federation]",
-            content,
-        )
-    else:
-        # Disable federation listener
-        content = re.sub(
-            r"- names: \[client, federation\]",
-            "- names: [client]",
-            content,
-        )
-        # Add/update whitelist
-        if re.search(pattern_simple, content, flags=re.MULTILINE):
-            content = re.sub(
-                pattern_simple,
-                "federation_domain_whitelist: []",
-                content,
-                flags=re.MULTILINE,
-            )
-        else:
-            content = content.rstrip() + (
-                "\n\n# Federation disabled — personal server.\n"
-                "federation_domain_whitelist: []\n"
-            )
+    return content
+
+
+def _patch_federation(content: str, enabled: bool) -> str:
+    """Patch both the listener list and the domain whitelist."""
+    content = _patch_federation_listener(content, enabled)
+    content = _set_federation_domain_whitelist(content, enabled)
     return content
 
 
@@ -126,7 +123,7 @@ def apply_settings_to_yaml(settings: dict) -> None:
     )
 
     # Federation
-    content = _set_federation_domain_whitelist(content, settings["federation_enabled"])
+    content = _patch_federation(content, settings["federation_enabled"])
 
     try:
         HOMESERVER_YAML.write_text(content)

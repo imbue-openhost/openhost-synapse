@@ -3,12 +3,20 @@
 }
 
 :3000 {
-	# Serve .well-known response for Matrix client discovery.
-	# Federation is disabled by default — no .well-known/matrix/server endpoint.
+	# Matrix client auto-discovery
 	handle /.well-known/matrix/client {
 		header Content-Type application/json
 		header Access-Control-Allow-Origin *
 		respond `{"m.homeserver":{"base_url":"PUBLIC_BASEURL_PLACEHOLDER"}}`
+	}
+
+	# Matrix federation server discovery.
+	# Points remote homeservers to this server on port 443 (standard HTTPS),
+	# so federation works without needing a separate port 8448.
+	handle /.well-known/matrix/server {
+		header Content-Type application/json
+		header Access-Control-Allow-Origin *
+		respond `{"m.server":"SERVER_NAME_PLACEHOLDER:443"}`
 	}
 
 	# Admin UI — proxy to the local Flask app.
