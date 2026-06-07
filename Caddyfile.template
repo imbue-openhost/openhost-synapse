@@ -4,11 +4,18 @@
 
 :3000 {
 	# Serve .well-known response for Matrix client discovery.
-	# Federation is disabled — no .well-known/matrix/server endpoint.
+	# Federation is disabled by default — no .well-known/matrix/server endpoint.
 	handle /.well-known/matrix/client {
 		header Content-Type application/json
 		header Access-Control-Allow-Origin *
 		respond `{"m.homeserver":{"base_url":"PUBLIC_BASEURL_PLACEHOLDER"}}`
+	}
+
+	# Admin UI — proxy to the local Flask app.
+	# zone_auth already gates all non-Matrix paths, so only the OpenHost owner
+	# can reach this endpoint.
+	handle /_openhost/admin* {
+		reverse_proxy localhost:8009
 	}
 
 	# Proxy everything else to Synapse (client-server + federation APIs).

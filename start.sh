@@ -14,7 +14,47 @@ export SYNAPSE_CONFIG_DIR="$DATA_DIR"
 export SYNAPSE_CONFIG_PATH="$DATA_DIR/homeserver.yaml"
 export SYNAPSE_DATA_DIR="$DATA_DIR"
 
+SETTINGS_FILE="$DATA_DIR/openhost_settings.json"
+
 mkdir -p "$DATA_DIR"
+
+# ---------------------------------------------------------------------------
+# openhost_settings.json — source of truth for admin-controlled toggles.
+# Written once on first boot; thereafter managed by the admin UI.
+# ---------------------------------------------------------------------------
+if [ ! -f "$SETTINGS_FILE" ]; then
+    cat > "$SETTINGS_FILE" <<'EOF'
+{
+  "federation_enabled": false,
+  "open_registration": true
+}
+EOF
+    echo "Created default settings: $SETTINGS_FILE"
+fi
+
+# Read current settings (use python3 which is available in the Synapse image)
+FEDERATION_ENABLED=$(python3 -c "
+import json, sys
+try:
+    with open('$SETTINGS_FILE') as f:
+        d = json.load(f)
+    print('true' if d.get('federation_enabled', False) else 'false')
+except Exception as e:
+    sys.stderr.write('Warning: could not read settings file: ' + str(e) + '\n')
+    print('false')
+")
+OPEN_REGISTRATION=$(python3 -c "
+import json, sys
+try:
+    with open('$SETTINGS_FILE') as f:
+        d = json.load(f)
+    print('true' if d.get('open_registration', True) else 'false')
+except Exception as e:
+    sys.stderr.write('Warning: could not read settings file: ' + str(e) + '\n')
+    print('true')
+")
+
+echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION"
 
 # Synapse's start.py hardcodes a few paths under /data (secret key files,
 # appservices glob).  If persistent storage is elsewhere, symlink individual
@@ -118,8 +158,6 @@ if [ ! -f "$DATA_DIR/homeserver.yaml" ]; then
 
 # OpenHost overrides
 public_baseurl: "$PUBLIC_BASEURL"
-enable_registration: true
-enable_registration_without_verification: true
 suppress_key_server_warning: true
 media_store_path: "$DATA_DIR/media_store"
 EOF
@@ -139,20 +177,59 @@ else
     fi
 fi
 
-# Remove federation from listeners — this is a personal server, federation
-# adds complexity without much benefit.  Only serve the client API.
-if grep -q "client, federation" "$DATA_DIR/homeserver.yaml"; then
-    echo "Disabling federation listener"
-    sed -i 's/\- names: \[client, federation\]/- names: [client]/' "$DATA_DIR/homeserver.yaml"
-fi
-
-# Block all federation with an empty domain whitelist (on every boot)
-if ! grep -q "^federation_domain_whitelist:" "$DATA_DIR/homeserver.yaml"; then
-    cat >> "$DATA_DIR/homeserver.yaml" <<EOF
+# ---------------------------------------------------------------------------
+# Apply federation setting from openhost_settings.json
+# ---------------------------------------------------------------------------
+if [ "$FEDERATION_ENABLED" = "true" ]; then
+    # Re-enable federation listener if it was disabled
+    if grep -q "- names: \[client\]" "$DATA_DIR/homeserver.yaml"; then
+        echo "Enabling federation listener"
+        sed -i 's/- names: \[client\]/- names: [client, federation]/' "$DATA_DIR/homeserver.yaml"
+    fi
+    # Remove federation_domain_whitelist restriction
+    sed -i '/^# Federation disabled/d' "$DATA_DIR/homeserver.yaml"
+    sed -i '/^federation_domain_whitelist: \[\]/d' "$DATA_DIR/homeserver.yaml"
+else
+    # Disable federation listener
+    if grep -q "client, federation" "$DATA_DIR/homeserver.yaml"; then
+        echo "Disabling federation listener"
+        sed -i 's/\- names: \[client, federation\]/- names: [client]/' "$DATA_DIR/homeserver.yaml"
+    fi
+    # Block all federation with an empty domain whitelist
+    if ! grep -q "^federation_domain_whitelist:" "$DATA_DIR/homeserver.yaml"; then
+        cat >> "$DATA_DIR/homeserver.yaml" <<EOF
 
 # Federation disabled — personal server, no need for cross-server communication.
 federation_domain_whitelist: []
 EOF
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Apply registration setting from openhost_settings.json
+# ---------------------------------------------------------------------------
+if [ "$OPEN_REGISTRATION" = "true" ]; then
+    if grep -q "^enable_registration:" "$DATA_DIR/homeserver.yaml"; then
+        sed -i "s|^enable_registration:.*|enable_registration: true|" "$DATA_DIR/homeserver.yaml"
+    else
+        echo "enable_registration: true" >> "$DATA_DIR/homeserver.yaml"
+    fi
+    if grep -q "^enable_registration_without_verification:" "$DATA_DIR/homeserver.yaml"; then
+        sed -i "s|^enable_registration_without_verification:.*|enable_registration_without_verification: true|" "$DATA_DIR/homeserver.yaml"
+    else
+        echo "enable_registration_without_verification: true" >> "$DATA_DIR/homeserver.yaml"
+    fi
+else
+    if grep -q "^enable_registration:" "$DATA_DIR/homeserver.yaml"; then
+        sed -i "s|^enable_registration:.*|enable_registration: false|" "$DATA_DIR/homeserver.yaml"
+    else
+        echo "enable_registration: false" >> "$DATA_DIR/homeserver.yaml"
+    fi
+    if grep -q "^enable_registration_without_verification:" "$DATA_DIR/homeserver.yaml"; then
+        sed -i "s|^enable_registration_without_verification:.*|enable_registration_without_verification: false|" "$DATA_DIR/homeserver.yaml"
+    else
+        echo "enable_registration_without_verification: false" >> "$DATA_DIR/homeserver.yaml"
+    fi
 fi
 
 # Always ensure relaxed rate limits (small personal server)
@@ -185,7 +262,7 @@ fi
 sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
     -e "s|PUBLIC_BASEURL_PLACEHOLDER|${PUBLIC_BASEURL}|g" \
     /app/Caddyfile.template > /app/Caddyfile
-echo "well-known: client_base=${PUBLIC_BASEURL} (federation disabled)"
+echo "well-known: client_base=${PUBLIC_BASEURL}"
 
 # Fix ownership for the host user (UID 1000)
 chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
@@ -195,6 +272,11 @@ chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
 caddy run --config /app/Caddyfile &
 CADDY_PID=$!
 echo "Caddy started (PID $CADDY_PID)"
+
+# Start the admin UI in background
+OPENHOST_APP_DATA_DIR="$DATA_DIR" python3 /app/admin.py &
+ADMIN_PID=$!
+echo "Admin UI started (PID $ADMIN_PID)"
 
 # Hand off to the official Synapse entrypoint
 echo "Starting Synapse..."
