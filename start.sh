@@ -686,12 +686,34 @@ provision_admin_token() {
             return 1
         fi
 
-        # Try to register the admin user — pass password via environment to avoid
-        # exposing it in /proc/<pid>/cmdline.
-        # Note: register_new_matrix_user passes -p to argv of a subprocess, which
-        # is visible in that child's cmdline. This is a known limitation of the
-        # Synapse tooling; the password is only used once during first boot.
-        ADMIN_PASS="$ADMIN_PASS" DATA_DIR="$DATA_DIR" python3 << 'REGPY'
+        # Create the openhost-admin user.
+        # When MAS is active: use mas-cli manage register-user (Synapse's /register is disabled).
+        # When MAS is not active: use register_new_matrix_user (Synapse's /register is active).
+        if [ -f "$MAS_CONFIG" ] && mas-cli --config "$MAS_CONFIG" manage list-admin-users 2>/dev/null | grep -q "openhost-admin"; then
+            echo "openhost-admin already exists in MAS"
+        elif [ -f "$MAS_CONFIG" ]; then
+            # MAS is active: register via mas-cli
+            echo "Registering openhost-admin via mas-cli..."
+            ADMIN_PASS="$ADMIN_PASS" python3 -c "
+import os, subprocess, sys
+pw = os.environ['ADMIN_PASS']
+result = subprocess.run(
+    ['mas-cli', '--config', '$MAS_CONFIG', 'manage', 'register-user',
+     '--username', 'openhost-admin',
+     '--password', pw,
+     '--admin',
+     '--ignore-password-complexity',
+     '--yes'],
+    capture_output=True, text=True
+)
+print(result.stdout, end='')
+if result.returncode != 0:
+    sys.stderr.write('mas register-user: ' + result.stderr + '\n')
+    sys.exit(1)
+" || echo "Warning: mas register-user failed (user may already exist)"
+        else
+            # MAS not active: use register_new_matrix_user
+            ADMIN_PASS="$ADMIN_PASS" DATA_DIR="$DATA_DIR" python3 << 'REGPY'
 import os, subprocess, sys
 pw = os.environ['ADMIN_PASS']
 data_dir = os.environ['DATA_DIR']
@@ -713,10 +735,9 @@ if result.returncode != 0:
     else:
         sys.stderr.write('openhost-admin user already exists, skipping registration\n')
 REGPY
-        # Log in to get an access token.
-        # When MAS is enabled, Synapse's login endpoint is delegated to MAS.
-        # We use the Synapse admin shared-secret endpoint to mint a token directly,
-        # which bypasses the MAS login flow (it uses /_synapse/admin endpoints).
+        fi
+
+        # Get admin token — works with or without MAS
         TOKEN=$(get_admin_token "$ADMIN_PASS")
 
         if [ -n "$TOKEN" ]; then
