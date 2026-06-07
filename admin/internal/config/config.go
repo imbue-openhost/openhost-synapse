@@ -196,8 +196,10 @@ func patchFederationDomainWhitelist(content string, enabled bool) string {
 
 func patchPasswordPolicy(content string, s *Settings) string {
 	// Remove existing password_config block including all indented sub-keys.
-	// The (?ms) flag makes . match newlines and ^ match line-starts.
-	content = regexp.MustCompile(`(?ms)^password_config:\n(?:[ \t]+.*\n)*`).ReplaceAllString(content, "")
+	// IMPORTANT: Do NOT use the 's' flag or '.*' here — that causes the regex
+	// to match across newlines and eat subsequent top-level YAML sections.
+	// Use '(?m)' for multiline ^ anchoring and '[^\n]*' to stay within each line.
+	content = regexp.MustCompile(`(?m)^password_config:\n(?:[ \t]+[^\n]*\n)*`).ReplaceAllString(content, "")
 	content = regexp.MustCompile(`\n{3,}`).ReplaceAllString(content, "\n\n")
 
 	block := fmt.Sprintf("password_config:\n  minimum_length: %d\n  require_digit: %v\n  require_punctuation: %v\n",
@@ -207,8 +209,11 @@ func patchPasswordPolicy(content string, s *Settings) string {
 }
 
 func patchRCLogin(content string, s *Settings) string {
-	// Remove existing rc_login block
-	re := regexp.MustCompile(`(?ms)^rc_login:\n(?:[ \t]+.*\n)*`)
+	// Remove existing rc_login block.
+	// IMPORTANT: Do NOT use the 's' flag or '.*' here — that causes the regex
+	// to match across newlines and eat subsequent top-level YAML sections
+	// (e.g. the database: block). Use '[^\n]*' to stay within each line.
+	re := regexp.MustCompile(`(?m)^rc_login:\n(?:[ \t]+[^\n]*\n)*`)
 	content = re.ReplaceAllString(content, "")
 	content = regexp.MustCompile(`\n{3,}`).ReplaceAllString(content, "\n\n")
 

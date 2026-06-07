@@ -24,6 +24,31 @@ enable_registration: false
 enable_registration_without_verification: false
 `
 
+// sampleYAMLWithDB is like sampleYAML but has a database block after the patched sections.
+// This tests that the regex does NOT eat the database section.
+const sampleYAMLWithDB = `server_name: "example.com"
+enable_registration: false
+enable_registration_without_verification: false
+rc_login:
+  address:
+    per_second: 5.0
+    burst_count: 20
+  account:
+    per_second: 5.0
+    burst_count: 20
+  failed_attempts:
+    per_second: 5.0
+    burst_count: 20
+password_config:
+  minimum_length: 8
+  require_digit: false
+  require_punctuation: false
+database:
+  name: sqlite3
+  args:
+    database: /data/homeserver.db
+`
+
 func TestSetYAMLBool_Update(t *testing.T) {
 	got := setYAMLBool(sampleYAML, "enable_registration", true)
 	if !strings.Contains(got, "enable_registration: true") {
@@ -130,5 +155,60 @@ func TestPatchPasswordPolicy_SubkeyNotOrphaned(t *testing.T) {
 	}
 	if !strings.Contains(content, "require_digit: true") {
 		t.Errorf("require_digit: true not found:\n%s", content)
+	}
+}
+
+// TestPatchRCLogin_DoesNotEatDatabaseSection is a regression test for a critical bug:
+// the regex used to strip rc_login must NOT eat subsequent top-level YAML sections.
+func TestPatchRCLogin_DoesNotEatDatabaseSection(t *testing.T) {
+	s := &Settings{RCLoginPerSecond: 10, RCLoginBurst: 50}
+	got := patchRCLogin(sampleYAMLWithDB, s)
+
+	if !strings.Contains(got, "database:") {
+		t.Errorf("REGRESSION: patchRCLogin ate the database: section!\nResult:\n%s", got)
+	}
+	if !strings.Contains(got, "homeserver.db") {
+		t.Errorf("REGRESSION: patchRCLogin ate the database args!\nResult:\n%s", got)
+	}
+	if !strings.Contains(got, "rc_login:") {
+		t.Errorf("rc_login block not present after patch:\n%s", got)
+	}
+	if strings.Count(got, "rc_login:") != 1 {
+		t.Errorf("expected exactly 1 rc_login: block, got %d:\n%s", strings.Count(got, "rc_login:"), got)
+	}
+}
+
+// TestPatchPasswordPolicy_DoesNotEatDatabaseSection is a regression test for the same bug.
+func TestPatchPasswordPolicy_DoesNotEatDatabaseSection(t *testing.T) {
+	s := &Settings{PasswordMinLength: 12}
+	got := patchPasswordPolicy(sampleYAMLWithDB, s)
+
+	if !strings.Contains(got, "database:") {
+		t.Errorf("REGRESSION: patchPasswordPolicy ate the database: section!\nResult:\n%s", got)
+	}
+	if !strings.Contains(got, "homeserver.db") {
+		t.Errorf("REGRESSION: patchPasswordPolicy ate the database args!\nResult:\n%s", got)
+	}
+	if !strings.Contains(got, "password_config:") {
+		t.Errorf("password_config block not present after patch:\n%s", got)
+	}
+	if strings.Count(got, "password_config:") != 1 {
+		t.Errorf("expected exactly 1 password_config: block, got %d:\n%s", strings.Count(got, "password_config:"), got)
+	}
+}
+
+// TestPatchRCLogin_IdempotentWithDB checks idempotency with the database section present.
+func TestPatchRCLogin_IdempotentWithDB(t *testing.T) {
+	s := &Settings{RCLoginPerSecond: 10, RCLoginBurst: 50}
+	once := patchRCLogin(sampleYAMLWithDB, s)
+	twice := patchRCLogin(once, s)
+
+	for _, content := range []string{once, twice} {
+		if !strings.Contains(content, "database:") {
+			t.Errorf("database: section missing after patchRCLogin:\n%s", content)
+		}
+		if strings.Count(content, "rc_login:") != 1 {
+			t.Errorf("expected 1 rc_login block, got %d:\n%s", strings.Count(content, "rc_login:"), content)
+		}
 	}
 }

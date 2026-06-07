@@ -274,7 +274,9 @@ password_block = f"""password_config:
 content = content.rstrip() + "\n" + password_block
 
 # Rate limits — remove existing rc_login block and rewrite
-content = re.sub(r'(?ms)^rc_login:\n(?:[ \t]+.*\n)*', '', content)
+# IMPORTANT: Do NOT use re.DOTALL or '.*' in the char class — that crosses newlines
+# and would eat subsequent top-level YAML sections (e.g. database:).
+content = re.sub(r'(?m)^rc_login:\n(?:[ \t]+[^\n]*\n)*', '', content)
 content = re.sub(r'\n{3,}', '\n\n', content)
 rc_block = f"""rc_login:
   address:
