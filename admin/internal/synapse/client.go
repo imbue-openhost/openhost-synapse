@@ -172,10 +172,15 @@ type UserList struct {
 }
 
 // ListUsers returns a page of users.
+// Note: the guests parameter is not supported when Synapse delegates to MAS
+// (matrix_authentication_service.enabled: true), so we omit it when including
+// guests is the default behavior.
 func (c *Client) ListUsers(from int, limit int, guestsIncluded bool, searchTerm string) (*UserList, error) {
 	params := url.Values{}
 	params.Set("from", strconv.Itoa(from))
 	params.Set("limit", strconv.Itoa(limit))
+	// Only set guests=false when explicitly excluding; don't set guests=true
+	// as it's unsupported when MAS delegation is active.
 	if !guestsIncluded {
 		params.Set("guests", "false")
 	}
@@ -387,25 +392,16 @@ type Stats struct {
 func (c *Client) GetStats() (*Stats, error) {
 	s := &Stats{}
 
-	// Total non-guest users: guests=false gives the count of non-guest accounts
-	usersData, err := c.get(adminPathV2 + "/users?limit=1&guests=false")
+	// Total users: omit guests parameter — not supported when MAS delegation is active.
+	// This returns all users by default (including guests if any).
+	usersData, err := c.get(adminPathV2 + "/users?limit=1")
 	if err == nil {
 		var resp struct {
 			Total int `json:"total"`
 		}
 		if err := json.Unmarshal(usersData, &resp); err == nil {
-			s.TotalNonGuests = resp.Total
-		}
-	}
-
-	// Total users including guests
-	allUsersData, err := c.get(adminPathV2 + "/users?limit=1&guests=true")
-	if err == nil {
-		var resp struct {
-			Total int `json:"total"`
-		}
-		if err := json.Unmarshal(allUsersData, &resp); err == nil {
 			s.TotalUsers = resp.Total
+			s.TotalNonGuests = resp.Total // approximate; guest distinction unavailable with MAS
 		}
 	}
 

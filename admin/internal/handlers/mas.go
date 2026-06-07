@@ -28,9 +28,11 @@ func (h *handler) masStatusPartial(w http.ResponseWriter, r *http.Request) {
 }
 
 // isMASOnline checks if the MAS server is responding on localhost:8080.
+// MAS does not expose a /health endpoint; we use the OIDC discovery endpoint
+// which is always present when MAS is running.
 func isMASOnline() bool {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://127.0.0.1:8080/health")
+	resp, err := client.Get("http://127.0.0.1:8080/.well-known/openid-configuration")
 	if err != nil {
 		return false
 	}

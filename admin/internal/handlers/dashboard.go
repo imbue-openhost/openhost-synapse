@@ -95,7 +95,8 @@ func (h *handler) statsPartial(w http.ResponseWriter, r *http.Request) {
 	}
 
 	version, _ := h.syn.ServerVersion()
-	users, err := h.syn.ListUsers(0, 1, true, "")
+	// Don't pass guests=true: unsupported when MAS delegation is active.
+	users, err := h.syn.ListUsers(0, 1, false, "")
 
 	data := statsData{Version: version}
 	if err != nil || users == nil {
