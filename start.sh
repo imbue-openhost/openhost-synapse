@@ -475,114 +475,120 @@ ADMIN_PID=$!
 echo "Admin server started (PID $ADMIN_PID)"
 
 # ---------------------------------------------------------------------------
-# get_admin_token PASSWORD: mints an admin access token for the openhost-admin
-# user. Uses the Synapse admin shared-secret registration endpoint to create a
-# token directly — this works regardless of whether MAS is enabled, because
-# /_synapse/admin/* endpoints are never delegated to MAS.
+# get_admin_token: mints an admin access token for openhost-admin.
+#
+# Strategy (works regardless of whether MAS is enabled):
+# 1. Use /_synapse/admin/v1/register (shared-secret) to create the user and
+#    get a token on first boot.
+# 2. On subsequent boots (user already exists), use the Synapse Admin API
+#    endpoint /_synapse/admin/v2/users/{userId}/login to mint a fresh token
+#    without going through MAS. This endpoint requires an existing admin token,
+#    but the nonce-based register endpoint can still issue one for re-registration.
+#    If that fails, we use register again with a throwaway username to get an
+#    admin token, then immediately use it to mint a token for openhost-admin.
+#
+# The key insight: /_synapse/admin/* endpoints are NEVER delegated to MAS.
 # ---------------------------------------------------------------------------
 get_admin_token() {
-    # Use the Synapse admin API shared-secret endpoint to create a bearer token.
-    # This doesn't rely on /_matrix/client/*/login (which MAS intercepts).
-    ADMIN_PASS="$1" DATA_DIR="$DATA_DIR" python3 << 'ADMINTOKEN'
-import json, os, urllib.request, sys, hmac, hashlib
+    ADMIN_PASS="$1" DATA_DIR="$DATA_DIR" SERVER_NAME="$SERVER_NAME" python3 << 'ADMINTOKEN'
+import json, os, urllib.request, urllib.error, sys, hmac
 
 admin_pass = os.environ['ADMIN_PASS']
 data_dir = os.environ['DATA_DIR']
+server_name = os.environ['SERVER_NAME']
+admin_user_id = f'@openhost-admin:{server_name}'
 
-# Read the registration shared secret from homeserver.yaml
-shared_secret = None
-try:
-    with open(data_dir + '/homeserver.yaml') as f:
-        for line in f:
-            if line.startswith('registration_shared_secret:'):
-                shared_secret = line.split(':', 1)[1].strip().strip('"\'')
-                break
-except Exception:
-    pass
+def synapse_request(method, path, data=None, token=None):
+    """Make a request to the Synapse admin API (bypasses MAS)."""
+    url = 'http://127.0.0.1:8008' + path
+    req = urllib.request.Request(url, data=data, method=method)
+    if data:
+        req.add_header('Content-Type', 'application/json')
+    if token:
+        req.add_header('Authorization', 'Bearer ' + token)
+    return urllib.request.urlopen(req)
 
-if not shared_secret:
-    # Fallback: try direct Matrix login (works if MAS is not enabled)
+def get_shared_secret():
+    """Read the registration_shared_secret from homeserver.yaml."""
     try:
+        with open(data_dir + '/homeserver.yaml') as f:
+            for line in f:
+                if line.startswith('registration_shared_secret:'):
+                    return line.split(':', 1)[1].strip().strip('"\'')
+    except Exception:
+        pass
+    return None
+
+def register_via_shared_secret(username, password):
+    """Register a user via the shared-secret endpoint. Returns access_token or None."""
+    shared_secret = get_shared_secret()
+    if not shared_secret:
+        return None
+    try:
+        with synapse_request('GET', '/_synapse/admin/v1/register') as resp:
+            nonce = json.loads(resp.read())['nonce']
+        mac = hmac.new(shared_secret.encode(), digestmod='sha1')
+        mac.update(nonce.encode())
+        mac.update(b'\x00')
+        mac.update(username.encode())
+        mac.update(b'\x00')
+        mac.update(password.encode())
+        mac.update(b'\x00')
+        mac.update(b'admin')
         payload = json.dumps({
-            'type': 'm.login.password',
-            'user': 'openhost-admin',
-            'password': admin_pass,
+            'nonce': nonce,
+            'username': username,
+            'password': password,
+            'admin': True,
+            'mac': mac.hexdigest(),
         }).encode()
-        req = urllib.request.Request(
-            'http://127.0.0.1:8008/_matrix/client/v3/login',
-            data=payload,
-            headers={'Content-Type': 'application/json'}
-        )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read())
-            print(data.get('access_token', ''))
+        with synapse_request('POST', '/_synapse/admin/v1/register', data=payload) as resp:
+            return json.loads(resp.read()).get('access_token')
+    except urllib.error.HTTPError as e:
+        if e.code == 400:
+            return None  # User already exists
+        sys.stderr.write(f'register error {e.code}: {e.read()}\n')
+        return None
     except Exception as e:
-        sys.stderr.write('login fallback error: ' + str(e) + '\n')
+        sys.stderr.write(f'register error: {e}\n')
+        return None
+
+def mint_token_for_user(admin_token, user_id):
+    """Use Synapse Admin API to mint a token for an existing user (works with MAS)."""
+    try:
+        payload = json.dumps({'valid_until_ms': None}).encode()
+        with synapse_request('POST', f'/_synapse/admin/v2/users/{user_id}/login',
+                            data=payload, token=admin_token) as resp:
+            return json.loads(resp.read()).get('access_token')
+    except Exception as e:
+        sys.stderr.write(f'mint token error: {e}\n')
+        return None
+
+# Step 1: Try to register openhost-admin (first boot)
+token = register_via_shared_secret('openhost-admin', admin_pass)
+if token:
+    print(token)
     sys.exit(0)
 
-# Use shared-secret registration to mint a token for the admin user
-# This uses /_synapse/admin/v1/register which is NOT delegated to MAS
-import urllib.parse
-try:
-    # Get nonce
-    nonce_req = urllib.request.Request('http://127.0.0.1:8008/_synapse/admin/v1/register')
-    with urllib.request.urlopen(nonce_req) as resp:
-        nonce = json.loads(resp.read())['nonce']
+# Step 2: User already exists. Use shared-secret register to get ANY admin token,
+# then use the admin login endpoint to mint a token for openhost-admin.
+# We register a temporary user with a unique name, use its token, then we're done.
+import time, hashlib
+tmp_user = 'oh-tmp-' + hashlib.sha1(str(time.time()).encode()).hexdigest()[:8]
+tmp_pass = hashlib.sha256(admin_pass.encode() + str(time.time()).encode()).hexdigest()[:32]
+bootstrap_token = register_via_shared_secret(tmp_user, tmp_pass)
 
-    # Compute HMAC-SHA1
-    mac = hmac.new(shared_secret.encode(), digestmod='sha1')
-    mac.update(nonce.encode())
-    mac.update(b'\x00')
-    mac.update(b'openhost-admin')
-    mac.update(b'\x00')
-    mac.update(admin_pass.encode())
-    mac.update(b'\x00')
-    mac.update(b'admin')
+if bootstrap_token:
+    # Mint token for openhost-admin using the bootstrap admin token
+    token = mint_token_for_user(bootstrap_token, admin_user_id)
+    if token:
+        print(token)
+        sys.exit(0)
+    sys.stderr.write('Could not mint token for openhost-admin via admin API\n')
+else:
+    sys.stderr.write('Could not get bootstrap admin token\n')
 
-    payload = json.dumps({
-        'nonce': nonce,
-        'username': 'openhost-admin',
-        'password': admin_pass,
-        'admin': True,
-        'mac': mac.hexdigest(),
-    }).encode()
-
-    reg_req = urllib.request.Request(
-        'http://127.0.0.1:8008/_synapse/admin/v1/register',
-        data=payload,
-        headers={'Content-Type': 'application/json'}
-    )
-    try:
-        with urllib.request.urlopen(reg_req) as resp:
-            data = json.loads(resp.read())
-            token = data.get('access_token', '')
-            if token:
-                print(token)
-                sys.exit(0)
-    except urllib.error.HTTPError as e:
-        # 400 = user already exists — fall through to login
-        if e.code != 400:
-            sys.stderr.write(f'register error: {e}\n')
-
-    # User already exists — try password login (may fail if MAS is enabled)
-    payload = json.dumps({
-        'type': 'm.login.password',
-        'user': 'openhost-admin',
-        'password': admin_pass,
-    }).encode()
-    req = urllib.request.Request(
-        'http://127.0.0.1:8008/_matrix/client/v3/login',
-        data=payload,
-        headers={'Content-Type': 'application/json'}
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read())
-            print(data.get('access_token', ''))
-    except Exception as e:
-        sys.stderr.write('password login error (may be expected if MAS is enabled): ' + str(e) + '\n')
-except Exception as e:
-    sys.stderr.write('get_admin_token error: ' + str(e) + '\n')
+sys.exit(1)
 ADMINTOKEN
 }
 

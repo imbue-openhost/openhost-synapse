@@ -121,4 +121,5 @@ All other paths (including `/`, `/_openhost/admin`) require OpenHost authenticat
 - `start.sh` -- Generates config on first boot, applies settings on every boot, starts Caddy, admin server, and Synapse
 - `Caddyfile.template` -- Routes `/` and `/_openhost/*` to the Go admin server; proxies Matrix APIs to Synapse
 - `admin/` -- Go HTTP server serving the admin UI on port 8009
-- `openhost.toml` -- OpenHost app manifest (2048 MB RAM, 2 CPU cores, app_data storage)
+- `openhost.toml` -- OpenHost app manifest (3072 MB RAM, 2 CPU cores, app_data storage)
+- `mas/mas.yaml.template` -- MAS configuration template (populated by start.sh)
