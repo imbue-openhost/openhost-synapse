@@ -14,7 +14,6 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
 from pathlib import Path
 
@@ -136,15 +135,29 @@ def apply_settings_to_yaml(settings: dict) -> None:
         raise
 
 
+def _find_synapse_pids() -> list[int]:
+    """Find running Synapse process IDs by scanning /proc without external tools."""
+    pids = []
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    cmdline = f.read().replace(b"\x00", b" ").decode(errors="replace")
+                if "synapse" in cmdline and "python" in cmdline:
+                    pids.append(int(entry))
+            except (OSError, ValueError):
+                continue
+    except OSError as exc:
+        app.logger.error("reload_synapse: could not scan /proc: %s", exc)
+    return pids
+
+
 def reload_synapse() -> bool:
     """Send SIGHUP to Synapse so it reloads config. Returns True on success."""
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "synapse"],
-            capture_output=True,
-            text=True,
-        )
-        pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
+        pids = _find_synapse_pids()
         if not pids:
             app.logger.warning("reload_synapse: no Synapse processes found")
             return False
@@ -152,7 +165,7 @@ def reload_synapse() -> bool:
             os.kill(pid, signal.SIGHUP)
         app.logger.info("reload_synapse: sent SIGHUP to pids %s", pids)
         return True
-    except (ValueError, ProcessLookupError, PermissionError, FileNotFoundError) as exc:
+    except (ValueError, ProcessLookupError, PermissionError) as exc:
         app.logger.error("reload_synapse: failed to reload Synapse: %s", exc)
         return False
 
