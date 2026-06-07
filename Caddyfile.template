@@ -11,12 +11,15 @@
 	}
 
 	# Matrix federation server discovery.
-	# Points remote homeservers to this server on port 443 (standard HTTPS),
-	# so federation works without needing a separate port 8448.
 	handle /.well-known/matrix/server {
 		header Content-Type application/json
 		header Access-Control-Allow-Origin *
 		respond `{"m.server":"SERVER_NAME_PLACEHOLDER:443"}`
+	}
+
+	# OIDC/MAS discovery endpoint — served by MAS
+	handle /.well-known/openid-configuration {
+		reverse_proxy localhost:8080
 	}
 
 	# Admin UI — proxy to the local Go admin server.
@@ -31,7 +34,51 @@
 		reverse_proxy localhost:8009
 	}
 
-	# Proxy all Matrix API paths to Synapse (client-server + federation APIs).
+	# MAS authentication service paths:
+	# The compat layer intercepts Matrix client auth endpoints and routes them to MAS.
+	# MAS handles login, logout, refresh, and registration when enabled.
+	handle /_matrix/client/*/login {
+		reverse_proxy localhost:8080
+	}
+	handle /_matrix/client/*/logout {
+		reverse_proxy localhost:8080
+	}
+	handle /_matrix/client/*/refresh {
+		reverse_proxy localhost:8080
+	}
+	handle /_matrix/client/*/register {
+		reverse_proxy localhost:8080
+	}
+	handle /_matrix/client/*/account/password {
+		reverse_proxy localhost:8080
+	}
+
+	# MAS OAuth2/OIDC token endpoints
+	handle /oauth2/* {
+		reverse_proxy localhost:8080
+	}
+
+	# MAS GraphQL API (used by account UI)
+	handle /api/graphql {
+		reverse_proxy localhost:8080
+	}
+
+	# MAS account management UI and admin UI
+	# MAS serves /account/* for user self-service and /admin/ for admin interface
+	handle /account/* {
+		reverse_proxy localhost:8080
+	}
+	handle /admin/* {
+		reverse_proxy localhost:8080
+	}
+	handle /login {
+		reverse_proxy localhost:8080
+	}
+	handle /logout {
+		reverse_proxy localhost:8080
+	}
+
+	# Proxy all other Matrix API paths to Synapse (client-server + federation APIs).
 	handle {
 		reverse_proxy localhost:8008 {
 			# Rewrite the Host header from X-Forwarded-Host so that Synapse

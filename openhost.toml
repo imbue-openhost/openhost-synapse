@@ -1,7 +1,7 @@
 [app]
 name = "synapse"
-version = "0.1.0"
-description = "Matrix Synapse homeserver - decentralized, encrypted communication"
+version = "0.2.0"
+description = "Matrix Synapse homeserver with MAS (matrix-authentication-service) for OIDC/OAuth2"
 
 [runtime.container]
 image = "Dockerfile"
@@ -12,10 +12,17 @@ public_paths = [
     "/_matrix/",
     "/_synapse/client/",
     "/.well-known/matrix/",
+    "/.well-known/openid-configuration",
+    "/oauth2/",
+    "/login",
+    "/logout",
+    "/account/",
+    "/api/graphql",
 ]
 
 [resources]
-memory_mb = 2048
+# Increased for PostgreSQL (MAS), MAS server, and Synapse running simultaneously
+memory_mb = 3072
 cpu_millicores = 2000
 
 [data]

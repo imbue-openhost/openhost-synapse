@@ -309,15 +309,162 @@ sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
     /app/Caddyfile.template > /app/Caddyfile
 echo "well-known: client_base=${PUBLIC_BASEURL}"
 
-# Fix ownership for the host user (UID 1000)
-chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# Set up PostgreSQL for Matrix Authentication Service (MAS).
+# MAS requires PostgreSQL; Synapse continues to use SQLite.
+# ---------------------------------------------------------------------------
+MAS_DIR="$DATA_DIR/mas"
+MAS_KEYS_DIR="$MAS_DIR/keys"
+MAS_CONFIG="$MAS_DIR/mas.yaml"
+PG_DATA_DIR="$DATA_DIR/mas/pgdata"
+PG_LOG="$PG_DATA_DIR/postgres.log"
+MAS_DB_PASS_FILE="$MAS_DIR/db_password"
+MAS_SECRET_FILE="$MAS_DIR/shared_secret"
+MAS_ENCRYPTION_FILE="$MAS_DIR/encryption_secret"
+
+# Create directories with postgres-writable permissions before switching user
+# postgres needs to own the pgdata dir; we need to own the mas dir for secrets
+mkdir -p "$MAS_KEYS_DIR" "$PG_DATA_DIR"
+chown postgres:postgres "$PG_DATA_DIR"
+# Keep $MAS_DIR root-owned but world-executable so postgres can traverse it
+chmod 755 "$MAS_DIR"
+
+# Initialize PostgreSQL data directory (first boot only)
+if [ ! -f "$PG_DATA_DIR/PG_VERSION" ]; then
+    echo "Initializing PostgreSQL for MAS..."
+    su -s /bin/sh postgres -c "initdb -D '$PG_DATA_DIR' --encoding=UTF8 --locale=C 2>&1"
+    echo "PostgreSQL initialized"
+fi
+
+# Start PostgreSQL with -w to wait for startup completion.
+# Store log inside pgdata so postgres can write to it without extra permission grants.
+echo "Starting PostgreSQL..."
+su -s /bin/sh postgres -c "pg_ctl -D '$PG_DATA_DIR' -l '$PG_LOG' start -w -o '-k /tmp'" 2>&1
+if [ $? -ne 0 ]; then
+    echo "ERROR: PostgreSQL failed to start — MAS will not be available"
+    # Continue without MAS rather than aborting Synapse startup
+    SKIP_MAS=1
+fi
+
+if [ -z "$SKIP_MAS" ]; then
+    echo "PostgreSQL started"
+
+    # Generate MAS secrets on first boot (before DB setup so we have the password)
+    if [ ! -f "$MAS_DB_PASS_FILE" ]; then
+        MAS_DB_PASS=$(openssl rand -hex 24)
+        (umask 077; printf '%s' "$MAS_DB_PASS" > "$MAS_DB_PASS_FILE")
+        echo "Generated MAS DB password"
+    else
+        MAS_DB_PASS=$(cat "$MAS_DB_PASS_FILE")
+    fi
+
+    if [ ! -f "$MAS_SECRET_FILE" ]; then
+        MAS_SECRET=$(openssl rand -hex 32)
+        (umask 077; printf '%s' "$MAS_SECRET" > "$MAS_SECRET_FILE")
+        echo "Generated MAS shared secret"
+    else
+        MAS_SECRET=$(cat "$MAS_SECRET_FILE")
+    fi
+
+    if [ ! -f "$MAS_ENCRYPTION_FILE" ]; then
+        MAS_ENC_SECRET=$(openssl rand -hex 32)
+        (umask 077; printf '%s' "$MAS_ENC_SECRET" > "$MAS_ENCRYPTION_FILE")
+        echo "Generated MAS encryption secret"
+    else
+        MAS_ENC_SECRET=$(cat "$MAS_ENCRYPTION_FILE")
+    fi
+
+    # Create PostgreSQL user and database for MAS (idempotent).
+    # Use PGPASSWORD env var so the password never appears in psql's argv.
+    su -s /bin/sh postgres -c "psql -h /tmp -tAc \"SELECT 1 FROM pg_roles WHERE rolname='mas'\" | grep -q 1 || createuser -h /tmp mas" 2>/dev/null || true
+    MAS_DB_PASS="$MAS_DB_PASS" su -s /bin/sh postgres -c "
+        psql -h /tmp -c \"ALTER USER mas WITH PASSWORD '\$MAS_DB_PASS';\" 2>/dev/null || true
+        psql -h /tmp -c \"SELECT 1 FROM pg_database WHERE datname='mas'\" | grep -q 1 || createdb -h /tmp -O mas mas 2>/dev/null || true
+    "
+    echo "MAS PostgreSQL database ready"
+
+    # Generate MAS RSA signing key (first boot only)
+    if [ ! -f "$MAS_KEYS_DIR/rsa.pem" ]; then
+        # Use 2048-bit for faster generation (adequate for signing tokens)
+        openssl genrsa -out "$MAS_KEYS_DIR/rsa.pem" 2048 2>/dev/null
+        chmod 600 "$MAS_KEYS_DIR/rsa.pem"
+        echo "Generated MAS RSA signing key"
+    fi
+
+    # Generate MAS config from template
+    sed \
+        -e "s|PUBLIC_BASEURL_PLACEHOLDER|${PUBLIC_BASEURL}|g" \
+        -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
+        -e "s|MAS_DB_PASSWORD_PLACEHOLDER|${MAS_DB_PASS}|g" \
+        -e "s|MAS_SHARED_SECRET_PLACEHOLDER|${MAS_SECRET}|g" \
+        -e "s|MAS_ENCRYPTION_SECRET_PLACEHOLDER|${MAS_ENC_SECRET}|g" \
+        -e "s|DATA_DIR_PLACEHOLDER|${DATA_DIR}|g" \
+        /app/mas.yaml.template > "$MAS_CONFIG"
+    chmod 600 "$MAS_CONFIG"
+    echo "MAS config generated: $MAS_CONFIG"
+
+    # Patch Synapse homeserver.yaml to enable MAS integration
+    MAS_SECRET="$MAS_SECRET" DATA_DIR="$DATA_DIR" python3 << 'MASPY'
+import re, sys, os
+
+yaml_path = os.environ['DATA_DIR'] + '/homeserver.yaml'
+mas_secret = os.environ['MAS_SECRET']
+
+try:
+    content = open(yaml_path).read()
+except OSError as e:
+    sys.stderr.write(f"Error: could not read homeserver.yaml: {e}\n")
+    sys.exit(1)
+
+# Remove existing matrix_authentication_service block
+content = re.sub(r'(?m)^matrix_authentication_service:\n(?:[ \t]+[^\n]*\n)*', '', content)
+content = re.sub(r'\n{3,}', '\n\n', content)
+
+# Add MAS integration block
+mas_block = f"""matrix_authentication_service:
+  enabled: true
+  endpoint: "http://127.0.0.1:8080"
+  secret: "{mas_secret}"
+"""
+content = content.rstrip() + "\n" + mas_block
+
+with open(yaml_path, "w") as f:
+    f.write(content)
+print("Synapse homeserver.yaml patched for MAS integration")
+MASPY
+
+    # Run MAS database migrations
+    echo "Running MAS database migrations..."
+    if ! mas-cli --config "$MAS_CONFIG" database migrate 2>&1; then
+        echo "Warning: MAS migration failed — MAS will start but may not function correctly"
+    fi
+fi # end SKIP_MAS
 
 # ---------------------------------------------------------------------------
-# Start Caddy (serves /, /_openhost/*, .well-known, proxies Matrix to Synapse)
+# Fix ownership for the host user (UID 1000)
+# Explicitly EXCLUDE pgdata from the chown (postgres must own it).
+# ---------------------------------------------------------------------------
+find "$DATA_DIR" -maxdepth 4 -not -path "$PG_DATA_DIR*" -exec chown 1000:1000 {} \; 2>/dev/null || true
+# Re-ensure postgres owns pgdata
+chown -R postgres:postgres "$PG_DATA_DIR" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Start Caddy (serves /, /_openhost/*, .well-known, proxies Matrix + MAS)
 # ---------------------------------------------------------------------------
 caddy run --config /app/Caddyfile &
 CADDY_PID=$!
 echo "Caddy started (PID $CADDY_PID)"
+
+# ---------------------------------------------------------------------------
+# Start Matrix Authentication Service (only if PostgreSQL started successfully)
+# ---------------------------------------------------------------------------
+if [ -z "$SKIP_MAS" ] && [ -f "$MAS_CONFIG" ]; then
+    mas-cli --config "$MAS_CONFIG" server &
+    MAS_PID=$!
+    echo "MAS server started (PID $MAS_PID)"
+else
+    echo "MAS skipped (PostgreSQL unavailable or MAS config missing)"
+fi
 
 # ---------------------------------------------------------------------------
 # Start Go admin server
@@ -329,31 +476,154 @@ ADMIN_PID=$!
 echo "Admin server started (PID $ADMIN_PID)"
 
 # ---------------------------------------------------------------------------
-# synapse_login PASSWORD: logs into Synapse as openhost-admin and prints the
-# access token to stdout. Credentials are passed via environment to avoid
-# exposing them in /proc/<pid>/cmdline.
+# get_admin_token: mints an admin access token for openhost-admin.
+#
+# Strategy:
+# 1. Use /_synapse/admin/v1/register (shared-secret) to create the user on
+#    first boot. This endpoint is never delegated to MAS.
+# 2. On subsequent boots (user already exists, registration returns 400):
+#    a. If MAS is configured, use 'mas-cli manage issue-compatibility-token'
+#       to mint a Synapse compat token — this works regardless of MAS state.
+#    b. Otherwise, use the Synapse Admin v1 user login endpoint.
 # ---------------------------------------------------------------------------
-synapse_login() {
-    ADMIN_PASS="$1" python3 << 'LOGINPY'
-import json, os, urllib.request, sys
-try:
-    pw = os.environ['ADMIN_PASS']
-    payload = json.dumps({
-        'type': 'm.login.password',
-        'user': 'openhost-admin',
-        'password': pw,
-    }).encode()
-    req = urllib.request.Request(
-        'http://127.0.0.1:8008/_matrix/client/v3/login',
-        data=payload,
-        headers={'Content-Type': 'application/json'}
-    )
-    with urllib.request.urlopen(req) as resp:
-        data = json.loads(resp.read())
-        print(data.get('access_token', ''))
-except Exception as e:
-    sys.stderr.write('synapse_login error: ' + str(e) + '\n')
-LOGINPY
+get_admin_token() {
+    ADMIN_PASS="$1" DATA_DIR="$DATA_DIR" SERVER_NAME="$SERVER_NAME" MAS_CONFIG="$MAS_CONFIG" python3 << 'ADMINTOKEN'
+import json, os, urllib.request, urllib.error, sys, hmac, subprocess
+
+admin_pass = os.environ['ADMIN_PASS']
+data_dir = os.environ['DATA_DIR']
+server_name = os.environ['SERVER_NAME']
+mas_config = os.environ.get('MAS_CONFIG', '')
+
+def get_shared_secret():
+    """Read the registration_shared_secret from homeserver.yaml."""
+    try:
+        with open(data_dir + '/homeserver.yaml') as f:
+            for line in f:
+                if line.startswith('registration_shared_secret:'):
+                    return line.split(':', 1)[1].strip().strip('"\'')
+    except Exception:
+        pass
+    return None
+
+def register_via_shared_secret(username, password):
+    """Register a user via /_synapse/admin/v1/register. Returns (token, user_existed)."""
+    shared_secret = get_shared_secret()
+    if not shared_secret:
+        return None, False
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:8008/_synapse/admin/v1/register') as resp:
+            nonce = json.loads(resp.read())['nonce']
+        mac = hmac.new(shared_secret.encode(), digestmod='sha1')
+        mac.update(nonce.encode())
+        mac.update(b'\x00')
+        mac.update(username.encode())
+        mac.update(b'\x00')
+        mac.update(password.encode())
+        mac.update(b'\x00')
+        mac.update(b'admin')
+        payload = json.dumps({
+            'nonce': nonce,
+            'username': username,
+            'password': password,
+            'admin': True,
+            'mac': mac.hexdigest(),
+        }).encode()
+        req = urllib.request.Request(
+            'http://127.0.0.1:8008/_synapse/admin/v1/register',
+            data=payload,
+            headers={'Content-Type': 'application/json'}
+        )
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read()).get('access_token'), False
+    except urllib.error.HTTPError as e:
+        if e.code == 400:
+            return None, True  # User already exists
+        sys.stderr.write(f'register error {e.code}\n')
+        return None, False
+    except Exception as e:
+        sys.stderr.write(f'register error: {e}\n')
+        return None, False
+
+def mas_issue_compat_token(username):
+    """Use mas-cli to issue a Synapse compat token (works when MAS is active)."""
+    if not mas_config or not os.path.exists(mas_config):
+        return None
+    try:
+        result = subprocess.run(
+            ['mas-cli', '--config', mas_config, 'manage',
+             'issue-compatibility-token', username,
+             '--yes-i-want-to-grant-synapse-admin-privileges'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            # Output is the token on stdout
+            return result.stdout.strip()
+        else:
+            sys.stderr.write(f'mas issue-compat-token error: {result.stderr}\n')
+    except Exception as e:
+        sys.stderr.write(f'mas-cli error: {e}\n')
+    return None
+
+def synapse_admin_login(token, user_id):
+    """Use Synapse Admin v1 login endpoint (only works if MAS is NOT enabled)."""
+    try:
+        payload = json.dumps({}).encode()
+        req = urllib.request.Request(
+            f'http://127.0.0.1:8008/_synapse/admin/v1/users/{user_id}/login',
+            data=payload,
+            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'}
+        )
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read()).get('access_token')
+    except Exception as e:
+        sys.stderr.write(f'admin login error: {e}\n')
+    return None
+
+# Step 1: Try to register the admin user (first boot)
+token, user_exists = register_via_shared_secret('openhost-admin', admin_pass)
+if token:
+    print(token)
+    sys.exit(0)
+
+if not user_exists:
+    sys.stderr.write('User registration failed for an unknown reason\n')
+    sys.exit(1)
+
+# Step 2: User already exists. Try MAS compat token first (works with MAS enabled).
+token = mas_issue_compat_token('openhost-admin')
+if token:
+    print(token)
+    sys.exit(0)
+
+# Step 3: MAS not available — try Synapse Admin v1 login endpoint (no MAS only).
+# This requires an admin token to call, so we temporarily register a bootstrap user.
+import time, hashlib
+tmp_user = 'oh-setup-' + hashlib.sha1(os.urandom(8)).hexdigest()[:10]
+tmp_pass = hashlib.sha256(os.urandom(32)).hexdigest()
+bootstrap_token, _ = register_via_shared_secret(tmp_user, tmp_pass)
+if bootstrap_token:
+    admin_user_id = f'@openhost-admin:{server_name}'
+    token = synapse_admin_login(bootstrap_token, admin_user_id)
+    # Deactivate the temporary bootstrap user (best-effort cleanup)
+    try:
+        payload = json.dumps({'erase': True}).encode()
+        deact_req = urllib.request.Request(
+            f'http://127.0.0.1:8008/_synapse/admin/v1/deactivate/@{tmp_user}:{server_name}',
+            data=payload,
+            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {bootstrap_token}'}
+        )
+        urllib.request.urlopen(deact_req)
+        sys.stderr.write(f'Cleaned up bootstrap user @{tmp_user}\n')
+    except Exception:
+        sys.stderr.write(f'Warning: could not clean up bootstrap user @{tmp_user}\n')
+    if token:
+        print(token)
+        sys.exit(0)
+
+sys.stderr.write('All admin token strategies failed\n')
+sys.exit(1)
+ADMINTOKEN
 }
 
 # ---------------------------------------------------------------------------
@@ -412,8 +682,11 @@ if result.returncode != 0:
     else:
         sys.stderr.write('openhost-admin user already exists, skipping registration\n')
 REGPY
-        # Log in to get an access token — pass password via env
-        TOKEN=$(synapse_login "$ADMIN_PASS")
+        # Log in to get an access token.
+        # When MAS is enabled, Synapse's login endpoint is delegated to MAS.
+        # We use the Synapse admin shared-secret endpoint to mint a token directly,
+        # which bypasses the MAS login flow (it uses /_synapse/admin endpoints).
+        TOKEN=$(get_admin_token "$ADMIN_PASS")
 
         if [ -n "$TOKEN" ]; then
             # Write with restricted permissions atomically to avoid TOCTOU race
@@ -426,16 +699,16 @@ REGPY
     else
         echo "Admin token already exists"
 
-        # Re-validate the token — if expired, re-login using stored password
+        # Re-validate the token — if expired, re-mint
         EXISTING_TOKEN=$(cat "$ADMIN_TOKEN_FILE")
         HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer $EXISTING_TOKEN" \
             "http://127.0.0.1:8008/_synapse/admin/v2/users?limit=1" 2>/dev/null || echo "000")
         if [ "$HTTP_STATUS" != "200" ]; then
-            echo "Admin token invalid (status $HTTP_STATUS), re-logging in..."
+            echo "Admin token invalid (status $HTTP_STATUS), refreshing..."
             STORED_PASS=$(cat "$DATA_DIR/admin_password" 2>/dev/null || echo "")
             if [ -n "$STORED_PASS" ]; then
-                TOKEN=$(synapse_login "$STORED_PASS")
+                TOKEN=$(get_admin_token "$STORED_PASS")
                 if [ -n "$TOKEN" ]; then
                     (umask 077; printf '%s' "$TOKEN" > "$ADMIN_TOKEN_FILE")
                     echo "Admin token refreshed"

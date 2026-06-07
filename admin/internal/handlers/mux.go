@@ -57,6 +57,7 @@ func NewMux(cfg *config.Config) http.Handler {
 	// HTMX partials
 	mux.HandleFunc("GET /_openhost/admin/partials/stats", h.statsPartial)
 	mux.HandleFunc("GET /_openhost/admin/partials/status", h.statusPartial)
+	mux.HandleFunc("GET /_openhost/admin/partials/mas-status", h.masStatusPartial)
 
 	return mux
 }
