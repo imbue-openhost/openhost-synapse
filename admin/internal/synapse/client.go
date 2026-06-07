@@ -172,10 +172,11 @@ type UserList struct {
 }
 
 // ListUsers returns a page of users.
-// When Synapse delegates to MAS, the guests default is true which is not supported.
-// We always send guests=false to override the default — this works both with
-// standalone Synapse and MAS-enabled Synapse (MAS doesn't support guest accounts).
-func (c *Client) ListUsers(from int, limit int, guestsIncluded bool, searchTerm string) (*UserList, error) {
+// Always sends guests=false to override Synapse's default (guests=true).
+// When MAS delegation is active, guests=true raises an error, so we always
+// exclude guests explicitly. The guestsIncluded parameter is retained for API
+// compatibility but is intentionally ignored.
+func (c *Client) ListUsers(from int, limit int, _ bool, searchTerm string) (*UserList, error) {
 	params := url.Values{}
 	params.Set("from", strconv.Itoa(from))
 	params.Set("limit", strconv.Itoa(limit))

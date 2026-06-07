@@ -519,7 +519,7 @@ echo "Admin server started (PID $ADMIN_PID)"
 # ---------------------------------------------------------------------------
 get_admin_token() {
     ADMIN_PASS="$1" DATA_DIR="$DATA_DIR" SERVER_NAME="$SERVER_NAME" MAS_CONFIG="$MAS_CONFIG" python3 << 'ADMINTOKEN'
-import json, os, urllib.request, urllib.error, sys, hmac, subprocess
+import json, os, urllib.request, urllib.error, sys, hmac, hashlib, subprocess
 
 admin_pass = os.environ['ADMIN_PASS']
 data_dir = os.environ['DATA_DIR']
@@ -557,7 +557,7 @@ def register_via_shared_secret(username, password):
     try:
         with urllib.request.urlopen('http://127.0.0.1:8008/_synapse/admin/v1/register') as resp:
             nonce = json.loads(resp.read())['nonce']
-        mac = hmac.new(shared_secret.encode(), digestmod='sha1')
+        mac = hmac.new(shared_secret.encode(), digestmod=hashlib.sha1)
         mac.update(nonce.encode())
         mac.update(b'\x00')
         mac.update(username.encode())
