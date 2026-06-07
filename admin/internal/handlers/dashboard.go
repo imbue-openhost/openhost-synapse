@@ -16,12 +16,20 @@ var dashboardTpl = template.Must(template.New("dashboard").Parse(`
   </div>
 </div>
 
+<div hx-get="/_openhost/admin/partials/mas-status"
+     hx-trigger="load"
+     hx-swap="innerHTML"
+     style="margin-bottom:1rem;">
+  <span class="spinner"></span>
+</div>
+
 <div class="card">
   <div class="card-title">Quick Actions</div>
   <div style="display:flex;gap:0.75rem;flex-wrap:wrap;">
     <a href="/_openhost/admin/users/new" class="btn btn-primary">+ New User</a>
     <a href="/_openhost/admin/tokens" class="btn btn-secondary">+ Reg. Token</a>
     <a href="/_openhost/admin/settings" class="btn btn-secondary">Settings</a>
+    <a href="/_mas/admin/" class="btn btn-secondary" target="_blank">MAS Admin</a>
   </div>
 </div>
 

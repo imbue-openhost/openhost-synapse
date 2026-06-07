@@ -309,15 +309,138 @@ sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
     /app/Caddyfile.template > /app/Caddyfile
 echo "well-known: client_base=${PUBLIC_BASEURL}"
 
-# Fix ownership for the host user (UID 1000)
-chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# Set up PostgreSQL for Matrix Authentication Service (MAS).
+# MAS requires PostgreSQL; Synapse continues to use SQLite.
+# ---------------------------------------------------------------------------
+MAS_DIR="$DATA_DIR/mas"
+MAS_KEYS_DIR="$MAS_DIR/keys"
+MAS_CONFIG="$MAS_DIR/mas.yaml"
+PG_DATA_DIR="$DATA_DIR/mas/pgdata"
+MAS_DB_PASS_FILE="$MAS_DIR/db_password"
+MAS_SECRET_FILE="$MAS_DIR/shared_secret"
+MAS_ENCRYPTION_FILE="$MAS_DIR/encryption_secret"
+
+mkdir -p "$MAS_KEYS_DIR" "$PG_DATA_DIR"
+
+# Initialize PostgreSQL data directory (first boot only)
+if [ ! -f "$PG_DATA_DIR/PG_VERSION" ]; then
+    echo "Initializing PostgreSQL for MAS..."
+    chown -R postgres:postgres "$PG_DATA_DIR"
+    su -s /bin/sh postgres -c "initdb -D '$PG_DATA_DIR' --encoding=UTF8 --locale=C" 2>&1
+    echo "PostgreSQL initialized"
+fi
+
+# Start PostgreSQL
+su -s /bin/sh postgres -c "pg_ctl -D '$PG_DATA_DIR' -l '$MAS_DIR/postgres.log' start -o '-k /tmp'" 2>&1 || true
+sleep 2
+echo "PostgreSQL started"
+
+# Generate MAS secrets on first boot
+if [ ! -f "$MAS_DB_PASS_FILE" ]; then
+    MAS_DB_PASS=$(openssl rand -hex 24)
+    (umask 077; printf '%s' "$MAS_DB_PASS" > "$MAS_DB_PASS_FILE")
+    echo "Generated MAS DB password"
+else
+    MAS_DB_PASS=$(cat "$MAS_DB_PASS_FILE")
+fi
+
+if [ ! -f "$MAS_SECRET_FILE" ]; then
+    MAS_SECRET=$(openssl rand -hex 32)
+    (umask 077; printf '%s' "$MAS_SECRET" > "$MAS_SECRET_FILE")
+    echo "Generated MAS shared secret"
+else
+    MAS_SECRET=$(cat "$MAS_SECRET_FILE")
+fi
+
+if [ ! -f "$MAS_ENCRYPTION_FILE" ]; then
+    MAS_ENC_SECRET=$(openssl rand -hex 32)
+    (umask 077; printf '%s' "$MAS_ENC_SECRET" > "$MAS_ENCRYPTION_FILE")
+    echo "Generated MAS encryption secret"
+else
+    MAS_ENC_SECRET=$(cat "$MAS_ENCRYPTION_FILE")
+fi
+
+# Create PostgreSQL user and database for MAS (idempotent)
+su -s /bin/sh postgres -c "psql -h /tmp -c \"CREATE USER mas WITH PASSWORD '$MAS_DB_PASS';\" 2>/dev/null || true"
+su -s /bin/sh postgres -c "psql -h /tmp -c \"CREATE DATABASE mas OWNER mas;\" 2>/dev/null || true"
+echo "MAS PostgreSQL database ready"
+
+# Generate MAS RSA signing key (first boot only)
+if [ ! -f "$MAS_KEYS_DIR/rsa.pem" ]; then
+    openssl genrsa -out "$MAS_KEYS_DIR/rsa.pem" 4096 2>/dev/null
+    chmod 600 "$MAS_KEYS_DIR/rsa.pem"
+    echo "Generated MAS RSA signing key"
+fi
+
+# Generate MAS config from template
+sed \
+    -e "s|PUBLIC_BASEURL_PLACEHOLDER|${PUBLIC_BASEURL}|g" \
+    -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
+    -e "s|MAS_DB_PASSWORD_PLACEHOLDER|${MAS_DB_PASS}|g" \
+    -e "s|MAS_SHARED_SECRET_PLACEHOLDER|${MAS_SECRET}|g" \
+    -e "s|MAS_ENCRYPTION_SECRET_PLACEHOLDER|${MAS_ENC_SECRET}|g" \
+    -e "s|DATA_DIR_PLACEHOLDER|${DATA_DIR}|g" \
+    /app/mas.yaml.template > "$MAS_CONFIG"
+chmod 600 "$MAS_CONFIG"
+echo "MAS config generated: $MAS_CONFIG"
+
+# Patch Synapse homeserver.yaml to enable MAS integration
+python3 << MASPY
+import re, sys
+
+yaml_path = "$DATA_DIR/homeserver.yaml"
+mas_secret = "$MAS_SECRET"
+
+try:
+    content = open(yaml_path).read()
+except OSError as e:
+    sys.stderr.write(f"Error: could not read homeserver.yaml: {e}\n")
+    sys.exit(1)
+
+# Remove existing matrix_authentication_service block
+content = re.sub(r'(?m)^matrix_authentication_service:\n(?:[ \t]+[^\n]*\n)*', '', content)
+content = re.sub(r'\n{3,}', '\n\n', content)
+
+# Add MAS integration block
+mas_block = f"""matrix_authentication_service:
+  enabled: true
+  endpoint: "http://127.0.0.1:8080"
+  secret: "{mas_secret}"
+"""
+content = content.rstrip() + "\n" + mas_block
+
+with open(yaml_path, "w") as f:
+    f.write(content)
+print("Synapse homeserver.yaml patched for MAS integration")
+MASPY
+
+# Run MAS database migrations
+echo "Running MAS database migrations..."
+mas-cli --config "$MAS_CONFIG" database migrate 2>&1 || {
+    echo "Warning: MAS migration failed (may be normal on first boot)"
+}
 
 # ---------------------------------------------------------------------------
-# Start Caddy (serves /, /_openhost/*, .well-known, proxies Matrix to Synapse)
+# Fix ownership for the host user (UID 1000)
+# ---------------------------------------------------------------------------
+chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
+# PostgreSQL needs to own its data dir
+chown -R postgres:postgres "$PG_DATA_DIR" "$MAS_DIR/postgres.log" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Start Caddy (serves /, /_openhost/*, .well-known, proxies Matrix + MAS)
 # ---------------------------------------------------------------------------
 caddy run --config /app/Caddyfile &
 CADDY_PID=$!
 echo "Caddy started (PID $CADDY_PID)"
+
+# ---------------------------------------------------------------------------
+# Start Matrix Authentication Service
+# ---------------------------------------------------------------------------
+mas-cli --config "$MAS_CONFIG" server &
+MAS_PID=$!
+echo "MAS server started (PID $MAS_PID)"
 
 # ---------------------------------------------------------------------------
 # Start Go admin server
