@@ -19,14 +19,19 @@
 		respond `{"m.server":"SERVER_NAME_PLACEHOLDER:443"}`
 	}
 
-	# Admin UI — proxy to the local Flask app.
+	# Admin UI — proxy to the local Go admin server.
 	# zone_auth already gates all non-Matrix paths, so only the OpenHost owner
-	# can reach this endpoint.
-	handle /_openhost/admin* {
+	# can reach these endpoints.
+	handle /_openhost/* {
 		reverse_proxy localhost:8009
 	}
 
-	# Proxy everything else to Synapse (client-server + federation APIs).
+	# Root path redirect to admin panel (also owner-only via zone_auth).
+	handle / {
+		reverse_proxy localhost:8009
+	}
+
+	# Proxy all Matrix API paths to Synapse (client-server + federation APIs).
 	handle {
 		reverse_proxy localhost:8008 {
 			# Rewrite the Host header from X-Forwarded-Host so that Synapse
