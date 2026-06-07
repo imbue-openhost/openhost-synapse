@@ -35,9 +35,8 @@
 	}
 
 	# MAS authentication service paths:
-	# - Login/logout/refresh (Matrix compat layer)
-	# - OAuth2/OIDC endpoints
-	# - MAS web UI (account management, admin)
+	# The compat layer intercepts Matrix client auth endpoints and routes them to MAS.
+	# MAS handles login, logout, refresh, and registration when enabled.
 	handle /_matrix/client/*/login {
 		reverse_proxy localhost:8080
 	}
@@ -54,14 +53,28 @@
 		reverse_proxy localhost:8080
 	}
 
-	# MAS OAuth2/OIDC and account UI paths
-	handle /_mas/* {
-		reverse_proxy localhost:8080
-	}
+	# MAS OAuth2/OIDC token endpoints
 	handle /oauth2/* {
 		reverse_proxy localhost:8080
 	}
+
+	# MAS GraphQL API (used by account UI)
 	handle /api/graphql {
+		reverse_proxy localhost:8080
+	}
+
+	# MAS account management UI and admin UI
+	# MAS serves /account/* for user self-service and /admin/ for admin interface
+	handle /account/* {
+		reverse_proxy localhost:8080
+	}
+	handle /admin/* {
+		reverse_proxy localhost:8080
+	}
+	handle /login {
+		reverse_proxy localhost:8080
+	}
+	handle /logout {
 		reverse_proxy localhost:8080
 	}
 

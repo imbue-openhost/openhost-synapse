@@ -1,10 +1,9 @@
-Matrix Synapse homeserver for OpenHost. Runs as a single Docker container:
+Matrix Synapse homeserver for OpenHost with matrix-authentication-service (MAS). Runs as a single Docker container:
 
 - Synapse latest (Matrix homeserver for end-to-end encrypted communication)
+- matrix-authentication-service v1.18.0 (OIDC/OAuth2 authentication provider)
+- PostgreSQL (for MAS; Synapse continues using SQLite)
 - Federation disabled by default (personal/team server use case)
-- Open registration enabled by default (no email verification required)
-- SQLite database (no external database required)
-- Persistent data in OpenHost's app_data directory
 - Admin UI at `/` and `/_openhost/admin` for managing all server settings
 
 ## How it works
@@ -90,9 +89,22 @@ All persistent data lives in `$OPENHOST_APP_DATA_DIR/`:
 - `homeserver.db` -- SQLite database (users, rooms, messages, etc.)
 - `media_store/` -- Uploaded media and thumbnails
 
+## Matrix Authentication Service (MAS)
+
+MAS provides OIDC/OAuth2 authentication for Matrix clients that support the new auth spec. It runs alongside Synapse and handles login, logout, token refresh, and registration.
+
+On first boot, MAS is provisioned automatically:
+- PostgreSQL database initialized at `$OPENHOST_APP_DATA_DIR/mas/pgdata`
+- RSA signing key generated at `$OPENHOST_APP_DATA_DIR/mas/keys/rsa.pem`
+- Secrets generated at `$OPENHOST_APP_DATA_DIR/mas/shared_secret` and `encryption_secret`
+- MAS config written to `$OPENHOST_APP_DATA_DIR/mas/mas.yaml`
+- Synapse patched with `matrix_authentication_service:` config block
+
+MAS admin interface is accessible at `/admin/` (owner-only via zone_auth).
+
 ## Resources
 
-The `openhost.toml` requests 2048 MB RAM and 2 CPU cores. Synapse's memory usage grows with the number of joined rooms and active users.
+The `openhost.toml` requests 3072 MB RAM and 2 CPU cores (increased for PostgreSQL + MAS + Synapse).
 
 ## Public paths
 

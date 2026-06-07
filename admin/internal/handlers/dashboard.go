@@ -29,7 +29,7 @@ var dashboardTpl = template.Must(template.New("dashboard").Parse(`
     <a href="/_openhost/admin/users/new" class="btn btn-primary">+ New User</a>
     <a href="/_openhost/admin/tokens" class="btn btn-secondary">+ Reg. Token</a>
     <a href="/_openhost/admin/settings" class="btn btn-secondary">Settings</a>
-    <a href="/_mas/admin/" class="btn btn-secondary" target="_blank">MAS Admin</a>
+    <a href="/admin/" class="btn btn-secondary" target="_blank">MAS Admin</a>
   </div>
 </div>
 

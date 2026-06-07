@@ -12,7 +12,7 @@ var masStatusTpl = template.Must(template.New("mas-status").Parse(`
 {{if .Online}}
 <div class="alert alert-success" style="margin-bottom:0;">
   MAS (matrix-authentication-service) is <strong>online</strong> — OIDC/OAuth2 enabled.
-  <a href="/_mas/admin/" style="color:var(--success);margin-left:0.5rem;">Open MAS Admin →</a>
+  <a href="/admin/" style="color:var(--success);margin-left:0.5rem;">Open MAS Admin →</a>
 </div>
 {{else}}
 <div class="alert alert-warning" style="margin-bottom:0;">
