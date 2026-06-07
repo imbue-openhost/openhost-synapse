@@ -264,7 +264,9 @@ if not federation_enabled:
     content = content.rstrip() + "\n\n# Federation disabled — personal server.\nfederation_domain_whitelist: []\n"
 
 # Password policy
-content = re.sub(r'(?ms)^password_config:.*?(?=\n\S|\Z)', '', content)
+# IMPORTANT: Do NOT use re.DOTALL — it makes '.*' cross newlines and eat subsequent YAML sections.
+# Match the password_config block by consuming only indented/blank lines after the key line.
+content = re.sub(r'(?m)^password_config:\n(?:[ \t]+[^\n]*\n)*', '', content)
 content = re.sub(r'\n{3,}', '\n\n', content)
 password_block = f"""password_config:
   minimum_length: {pw_min_len}
