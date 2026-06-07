@@ -537,11 +537,23 @@ def get_shared_secret():
         pass
     return None
 
+def mas_is_active():
+    """Check if MAS is enabled by looking at homeserver.yaml."""
+    try:
+        with open(data_dir + '/homeserver.yaml') as f:
+            for line in f:
+                if 'matrix_authentication_service' in line:
+                    return True
+    except Exception:
+        pass
+    return False
+
 def register_via_shared_secret(username, password):
-    """Register a user via /_synapse/admin/v1/register. Returns (token, user_existed)."""
+    """Register a user via /_synapse/admin/v1/register. Returns (token, user_existed).
+    Returns (None, None) if the endpoint is unavailable (e.g. MAS enabled)."""
     shared_secret = get_shared_secret()
     if not shared_secret:
-        return None, False
+        return None, None
     try:
         with urllib.request.urlopen('http://127.0.0.1:8008/_synapse/admin/v1/register') as resp:
             nonce = json.loads(resp.read())['nonce']
@@ -570,6 +582,9 @@ def register_via_shared_secret(username, password):
     except urllib.error.HTTPError as e:
         if e.code == 400:
             return None, True  # User already exists
+        if e.code == 404:
+            # Endpoint disabled (e.g. when MAS is active)
+            return None, None
         sys.stderr.write(f'register error {e.code}\n')
         return None, False
     except Exception as e:
@@ -611,11 +626,29 @@ def synapse_admin_login(token, user_id):
         sys.stderr.write(f'admin login error: {e}\n')
     return None
 
-# Step 1: Try to register the admin user (first boot)
+# Strategy selection: MAS enabled vs standalone Synapse
+if mas_is_active() and mas_config and os.path.exists(mas_config):
+    # MAS is enabled — skip shared-secret registration (endpoint is disabled).
+    # The openhost-admin user was registered via mas-cli in provision_admin_token.
+    # Just issue a compat token directly.
+    sys.stderr.write('MAS is active, skipping shared-secret registration\n')
+    token = mas_issue_compat_token('openhost-admin')
+    if token:
+        print(token)
+        sys.exit(0)
+    sys.stderr.write('mas-cli issue-compatibility-token failed\n')
+    sys.exit(1)
+
+# Step 1: Standalone Synapse — try to register via shared-secret (first boot)
 token, user_exists = register_via_shared_secret('openhost-admin', admin_pass)
 if token:
     print(token)
     sys.exit(0)
+
+if user_exists is None:
+    # Endpoint is unavailable for an unknown reason
+    sys.stderr.write('Shared-secret endpoint unavailable\n')
+    sys.exit(1)
 
 if not user_exists:
     sys.stderr.write('User registration failed for an unknown reason\n')
@@ -697,9 +730,10 @@ provision_admin_token() {
             ADMIN_PASS="$ADMIN_PASS" python3 -c "
 import os, subprocess, sys
 pw = os.environ['ADMIN_PASS']
+# Username is positional, not --username flag
 result = subprocess.run(
     ['mas-cli', '--config', '$MAS_CONFIG', 'manage', 'register-user',
-     '--username', 'openhost-admin',
+     'openhost-admin',
      '--password', pw,
      '--admin',
      '--ignore-password-complexity',
@@ -708,8 +742,8 @@ result = subprocess.run(
 )
 print(result.stdout, end='')
 if result.returncode != 0:
+    # May fail if user already exists (not an error)
     sys.stderr.write('mas register-user: ' + result.stderr + '\n')
-    sys.exit(1)
 " || echo "Warning: mas register-user failed (user may already exist)"
         else
             # MAS not active: use register_new_matrix_user
