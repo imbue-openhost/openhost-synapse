@@ -375,10 +375,11 @@ if [ -z "$SKIP_MAS" ]; then
     fi
 
     # Create PostgreSQL user and database for MAS (idempotent).
-    # Passwords are passed via environment, not shell args, to avoid /proc exposure.
+    # Use PGPASSWORD env var so the password never appears in psql's argv.
+    su -s /bin/sh postgres -c "psql -h /tmp -tAc \"SELECT 1 FROM pg_roles WHERE rolname='mas'\" | grep -q 1 || createuser -h /tmp mas" 2>/dev/null || true
     MAS_DB_PASS="$MAS_DB_PASS" su -s /bin/sh postgres -c "
-        psql -h /tmp -c \"CREATE USER mas WITH PASSWORD '\$MAS_DB_PASS';\" 2>/dev/null || true
-        psql -h /tmp -c \"CREATE DATABASE mas OWNER mas;\" 2>/dev/null || true
+        psql -h /tmp -c \"ALTER USER mas WITH PASSWORD '\$MAS_DB_PASS';\" 2>/dev/null || true
+        psql -h /tmp -c \"SELECT 1 FROM pg_database WHERE datname='mas'\" | grep -q 1 || createdb -h /tmp -O mas mas 2>/dev/null || true
     "
     echo "MAS PostgreSQL database ready"
 
@@ -477,36 +478,22 @@ echo "Admin server started (PID $ADMIN_PID)"
 # ---------------------------------------------------------------------------
 # get_admin_token: mints an admin access token for openhost-admin.
 #
-# Strategy (works regardless of whether MAS is enabled):
-# 1. Use /_synapse/admin/v1/register (shared-secret) to create the user and
-#    get a token on first boot.
-# 2. On subsequent boots (user already exists), use the Synapse Admin API
-#    endpoint /_synapse/admin/v2/users/{userId}/login to mint a fresh token
-#    without going through MAS. This endpoint requires an existing admin token,
-#    but the nonce-based register endpoint can still issue one for re-registration.
-#    If that fails, we use register again with a throwaway username to get an
-#    admin token, then immediately use it to mint a token for openhost-admin.
-#
-# The key insight: /_synapse/admin/* endpoints are NEVER delegated to MAS.
+# Strategy:
+# 1. Use /_synapse/admin/v1/register (shared-secret) to create the user on
+#    first boot. This endpoint is never delegated to MAS.
+# 2. On subsequent boots (user already exists, registration returns 400):
+#    a. If MAS is configured, use 'mas-cli manage issue-compatibility-token'
+#       to mint a Synapse compat token — this works regardless of MAS state.
+#    b. Otherwise, use the Synapse Admin v1 user login endpoint.
 # ---------------------------------------------------------------------------
 get_admin_token() {
-    ADMIN_PASS="$1" DATA_DIR="$DATA_DIR" SERVER_NAME="$SERVER_NAME" python3 << 'ADMINTOKEN'
-import json, os, urllib.request, urllib.error, sys, hmac
+    ADMIN_PASS="$1" DATA_DIR="$DATA_DIR" SERVER_NAME="$SERVER_NAME" MAS_CONFIG="$MAS_CONFIG" python3 << 'ADMINTOKEN'
+import json, os, urllib.request, urllib.error, sys, hmac, subprocess
 
 admin_pass = os.environ['ADMIN_PASS']
 data_dir = os.environ['DATA_DIR']
 server_name = os.environ['SERVER_NAME']
-admin_user_id = f'@openhost-admin:{server_name}'
-
-def synapse_request(method, path, data=None, token=None):
-    """Make a request to the Synapse admin API (bypasses MAS)."""
-    url = 'http://127.0.0.1:8008' + path
-    req = urllib.request.Request(url, data=data, method=method)
-    if data:
-        req.add_header('Content-Type', 'application/json')
-    if token:
-        req.add_header('Authorization', 'Bearer ' + token)
-    return urllib.request.urlopen(req)
+mas_config = os.environ.get('MAS_CONFIG', '')
 
 def get_shared_secret():
     """Read the registration_shared_secret from homeserver.yaml."""
@@ -520,12 +507,12 @@ def get_shared_secret():
     return None
 
 def register_via_shared_secret(username, password):
-    """Register a user via the shared-secret endpoint. Returns access_token or None."""
+    """Register a user via /_synapse/admin/v1/register. Returns (token, user_existed)."""
     shared_secret = get_shared_secret()
     if not shared_secret:
-        return None
+        return None, False
     try:
-        with synapse_request('GET', '/_synapse/admin/v1/register') as resp:
+        with urllib.request.urlopen('http://127.0.0.1:8008/_synapse/admin/v1/register') as resp:
             nonce = json.loads(resp.read())['nonce']
         mac = hmac.new(shared_secret.encode(), digestmod='sha1')
         mac.update(nonce.encode())
@@ -542,52 +529,99 @@ def register_via_shared_secret(username, password):
             'admin': True,
             'mac': mac.hexdigest(),
         }).encode()
-        with synapse_request('POST', '/_synapse/admin/v1/register', data=payload) as resp:
-            return json.loads(resp.read()).get('access_token')
+        req = urllib.request.Request(
+            'http://127.0.0.1:8008/_synapse/admin/v1/register',
+            data=payload,
+            headers={'Content-Type': 'application/json'}
+        )
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read()).get('access_token'), False
     except urllib.error.HTTPError as e:
         if e.code == 400:
-            return None  # User already exists
-        sys.stderr.write(f'register error {e.code}: {e.read()}\n')
-        return None
+            return None, True  # User already exists
+        sys.stderr.write(f'register error {e.code}\n')
+        return None, False
     except Exception as e:
         sys.stderr.write(f'register error: {e}\n')
-        return None
+        return None, False
 
-def mint_token_for_user(admin_token, user_id):
-    """Use Synapse Admin API to mint a token for an existing user (works with MAS)."""
+def mas_issue_compat_token(username):
+    """Use mas-cli to issue a Synapse compat token (works when MAS is active)."""
+    if not mas_config or not os.path.exists(mas_config):
+        return None
     try:
-        payload = json.dumps({'valid_until_ms': None}).encode()
-        with synapse_request('POST', f'/_synapse/admin/v2/users/{user_id}/login',
-                            data=payload, token=admin_token) as resp:
+        result = subprocess.run(
+            ['mas-cli', '--config', mas_config, 'manage',
+             'issue-compatibility-token', username,
+             '--yes-i-want-to-grant-synapse-admin-privileges'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            # Output is the token on stdout
+            return result.stdout.strip()
+        else:
+            sys.stderr.write(f'mas issue-compat-token error: {result.stderr}\n')
+    except Exception as e:
+        sys.stderr.write(f'mas-cli error: {e}\n')
+    return None
+
+def synapse_admin_login(token, user_id):
+    """Use Synapse Admin v1 login endpoint (only works if MAS is NOT enabled)."""
+    try:
+        payload = json.dumps({}).encode()
+        req = urllib.request.Request(
+            f'http://127.0.0.1:8008/_synapse/admin/v1/users/{user_id}/login',
+            data=payload,
+            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'}
+        )
+        with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read()).get('access_token')
     except Exception as e:
-        sys.stderr.write(f'mint token error: {e}\n')
-        return None
+        sys.stderr.write(f'admin login error: {e}\n')
+    return None
 
-# Step 1: Try to register openhost-admin (first boot)
-token = register_via_shared_secret('openhost-admin', admin_pass)
+# Step 1: Try to register the admin user (first boot)
+token, user_exists = register_via_shared_secret('openhost-admin', admin_pass)
 if token:
     print(token)
     sys.exit(0)
 
-# Step 2: User already exists. Use shared-secret register to get ANY admin token,
-# then use the admin login endpoint to mint a token for openhost-admin.
-# We register a temporary user with a unique name, use its token, then we're done.
-import time, hashlib
-tmp_user = 'oh-tmp-' + hashlib.sha1(str(time.time()).encode()).hexdigest()[:8]
-tmp_pass = hashlib.sha256(admin_pass.encode() + str(time.time()).encode()).hexdigest()[:32]
-bootstrap_token = register_via_shared_secret(tmp_user, tmp_pass)
+if not user_exists:
+    sys.stderr.write('User registration failed for an unknown reason\n')
+    sys.exit(1)
 
+# Step 2: User already exists. Try MAS compat token first (works with MAS enabled).
+token = mas_issue_compat_token('openhost-admin')
+if token:
+    print(token)
+    sys.exit(0)
+
+# Step 3: MAS not available — try Synapse Admin v1 login endpoint (no MAS only).
+# This requires an admin token to call, so we temporarily register a bootstrap user.
+import time, hashlib
+tmp_user = 'oh-setup-' + hashlib.sha1(os.urandom(8)).hexdigest()[:10]
+tmp_pass = hashlib.sha256(os.urandom(32)).hexdigest()
+bootstrap_token, _ = register_via_shared_secret(tmp_user, tmp_pass)
 if bootstrap_token:
-    # Mint token for openhost-admin using the bootstrap admin token
-    token = mint_token_for_user(bootstrap_token, admin_user_id)
+    admin_user_id = f'@openhost-admin:{server_name}'
+    token = synapse_admin_login(bootstrap_token, admin_user_id)
+    # Deactivate the temporary bootstrap user (best-effort cleanup)
+    try:
+        payload = json.dumps({'erase': True}).encode()
+        deact_req = urllib.request.Request(
+            f'http://127.0.0.1:8008/_synapse/admin/v1/deactivate/@{tmp_user}:{server_name}',
+            data=payload,
+            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {bootstrap_token}'}
+        )
+        urllib.request.urlopen(deact_req)
+        sys.stderr.write(f'Cleaned up bootstrap user @{tmp_user}\n')
+    except Exception:
+        sys.stderr.write(f'Warning: could not clean up bootstrap user @{tmp_user}\n')
     if token:
         print(token)
         sys.exit(0)
-    sys.stderr.write('Could not mint token for openhost-admin via admin API\n')
-else:
-    sys.stderr.write('Could not get bootstrap admin token\n')
 
+sys.stderr.write('All admin token strategies failed\n')
 sys.exit(1)
 ADMINTOKEN
 }
