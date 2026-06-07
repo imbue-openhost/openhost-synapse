@@ -15,6 +15,7 @@ export SYNAPSE_CONFIG_PATH="$DATA_DIR/homeserver.yaml"
 export SYNAPSE_DATA_DIR="$DATA_DIR"
 
 SETTINGS_FILE="$DATA_DIR/openhost_settings.json"
+ADMIN_TOKEN_FILE="$DATA_DIR/admin_token"
 
 mkdir -p "$DATA_DIR"
 
@@ -26,7 +27,14 @@ if [ ! -f "$SETTINGS_FILE" ]; then
     cat > "$SETTINGS_FILE" <<'EOF'
 {
   "federation_enabled": false,
-  "open_registration": true
+  "open_registration": true,
+  "rc_login_per_second": 10,
+  "rc_login_burst": 50,
+  "max_upload_size_mb": 50,
+  "password_min_length": 8,
+  "password_require_digit": false,
+  "password_require_symbol": false,
+  "allow_public_rooms": true
 }
 EOF
     echo "Created default settings: $SETTINGS_FILE"
@@ -56,9 +64,7 @@ except Exception as e:
 
 echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION"
 
-# Synapse's start.py hardcodes a few paths under /data (secret key files,
-# appservices glob).  If persistent storage is elsewhere, symlink individual
-# items so those hardcoded reads/writes hit the persistent directory.
+# Symlink /data items -> persistent dir so hardcoded /data/<file> paths resolve correctly.
 if [ "$DATA_DIR" != "/data" ]; then
     # Migrate any existing data that landed on the ephemeral /data to
     # persistent storage (one-time fix for prior broken deployments).
@@ -178,113 +184,121 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Apply federation setting from openhost_settings.json
-# Use Python to reliably patch the YAML listener list and whitelist —
-# sed is fragile against Synapse's varied whitespace/quoting.
+# Apply settings from openhost_settings.json to homeserver.yaml
 # ---------------------------------------------------------------------------
 python3 << PYEOF
-import re, sys
+import re, sys, json
 
-path = "$DATA_DIR/homeserver.yaml"
-federation_enabled = "$FEDERATION_ENABLED" == "true"
+settings_path = "$SETTINGS_FILE"
+yaml_path = "$DATA_DIR/homeserver.yaml"
+
+# Load settings
+try:
+    with open(settings_path) as f:
+        settings = json.load(f)
+except Exception as e:
+    sys.stderr.write(f"Warning: could not read settings: {e}\n")
+    settings = {}
+
+federation_enabled = settings.get("federation_enabled", False)
+open_registration = settings.get("open_registration", True)
+allow_public_rooms = settings.get("allow_public_rooms", True)
+max_upload_mb = settings.get("max_upload_size_mb", 50)
+pw_min_len = settings.get("password_min_length", 8)
+pw_require_digit = settings.get("password_require_digit", False)
+pw_require_symbol = settings.get("password_require_symbol", False)
+rc_per_sec = settings.get("rc_login_per_second", 10)
+rc_burst = settings.get("rc_login_burst", 50)
 
 try:
-    content = open(path).read()
+    content = open(yaml_path).read()
 except OSError as e:
-    sys.stderr.write(f"Warning: could not read homeserver.yaml: {e}\n")
-    sys.exit(0)
+    sys.stderr.write(f"Error: could not read homeserver.yaml: {e}\n")
+    sys.exit(1)
 
-# ---- Listener names ----
-# Synapse generates listeners with a "names" list. We need to add or remove
-# "federation" from that list. Handle both inline-list and multi-line formats.
-def set_federation_listener(content, enabled):
-    # Match "- names: [client]" or "- names: [client, federation]" (with optional spaces)
-    # Also handle "names: [client]" without leading dash (inside a list item)
+def set_yaml_bool(content, key, value):
+    val = "true" if value else "false"
+    pattern = re.compile(rf"^{re.escape(key)}:.*$", re.MULTILINE)
+    replacement = f"{key}: {val}"
+    if pattern.search(content):
+        return pattern.sub(replacement, content)
+    return content.rstrip() + f"\n{replacement}\n"
+
+def set_yaml_value(content, key, value):
+    pattern = re.compile(rf"^{re.escape(key)}:.*$", re.MULTILINE)
+    replacement = f"{key}: {value}"
+    if pattern.search(content):
+        return pattern.sub(replacement, content)
+    return content.rstrip() + f"\n{replacement}\n"
+
+# Registration
+content = set_yaml_bool(content, "enable_registration", open_registration)
+content = set_yaml_bool(content, "enable_registration_without_verification", open_registration)
+
+# Public rooms
+content = set_yaml_bool(content, "allow_public_rooms_without_auth", allow_public_rooms)
+content = set_yaml_bool(content, "allow_public_rooms_over_federation", federation_enabled and allow_public_rooms)
+
+# Upload size
+content = set_yaml_value(content, "max_upload_size", f"{max_upload_mb}M")
+
+# Federation listener
+def patch_federation_listener(content, enabled):
+    # Group 1 captures everything UP TO but NOT including the '[',
+    # so the replacement can safely emit the full '[...]' list.
     def replace_names(m):
-        prefix = m.group(1)  # everything before the list
-        names_str = m.group(2)
-        # Parse the names
-        names = [n.strip().strip("'\"") for n in names_str.split(",")]
-        names = [n for n in names if n and n not in ("client", "federation")]
-        names = ["client"]
+        prefix = m.group(1)  # e.g. "      - names: " (no trailing '[')
         if enabled:
-            names = ["client", "federation"]
-        return prefix + "[" + ", ".join(names) + "]"
+            return prefix + "[client, federation]"
+        return prefix + "[client]"
+    pattern = re.compile(r'((?:-\s+)?names:\s*)\[client(?:,\s*federation)?\]')
+    return pattern.sub(replace_names, content)
 
-    # Match inline list format: names: [client] or names: [client, federation]
-    pattern = r'((?:- )?names:\s*\[)(client(?:,\s*federation)?)\]'
-    new_content = re.sub(pattern, replace_names, content)
-    if new_content != content:
-        return new_content
+content = patch_federation_listener(content, federation_enabled)
 
-    # If no match found and federation_enabled, try to find listener block and ensure federation
-    return content
-
-content = set_federation_listener(content, federation_enabled)
-
-# ---- federation_domain_whitelist ----
-# Remove any existing whitelist lines (and their comments)
+# Federation domain whitelist
 content = re.sub(r'\n# Federation disabled[^\n]*\n', '\n', content)
-content = re.sub(r'^federation_domain_whitelist:.*$', '', content, flags=re.MULTILINE)
-content = re.sub(r'\n{3,}', '\n\n', content)  # collapse excess blank lines
-
+content = re.sub(r'(?m)^federation_domain_whitelist:.*$', '', content)
+content = re.sub(r'\n{3,}', '\n\n', content)
 if not federation_enabled:
     content = content.rstrip() + "\n\n# Federation disabled — personal server.\nfederation_domain_whitelist: []\n"
 
-open(path, "w").write(content)
-if federation_enabled:
-    print("Federation listener enabled, whitelist restriction removed")
-else:
-    print("Federation listener client-only, whitelist blocks all federation")
+# Password policy
+# IMPORTANT: Do NOT use re.DOTALL — it makes '.*' cross newlines and eat subsequent YAML sections.
+# Match the password_config block by consuming only indented/blank lines after the key line.
+content = re.sub(r'(?m)^password_config:\n(?:[ \t]+[^\n]*\n)*', '', content)
+content = re.sub(r'\n{3,}', '\n\n', content)
+password_block = f"""password_config:
+  minimum_length: {pw_min_len}
+  require_digit: {'true' if pw_require_digit else 'false'}
+  require_punctuation: {'true' if pw_require_symbol else 'false'}
+"""
+content = content.rstrip() + "\n" + password_block
+
+# Rate limits — remove existing rc_login block and rewrite
+# IMPORTANT: Do NOT use re.DOTALL or '.*' in the char class — that crosses newlines
+# and would eat subsequent top-level YAML sections (e.g. database:).
+content = re.sub(r'(?m)^rc_login:\n(?:[ \t]+[^\n]*\n)*', '', content)
+content = re.sub(r'\n{3,}', '\n\n', content)
+rc_block = f"""rc_login:
+  address:
+    per_second: {rc_per_sec}
+    burst_count: {rc_burst}
+  account:
+    per_second: {rc_per_sec}
+    burst_count: {rc_burst}
+  failed_attempts:
+    per_second: {rc_per_sec}
+    burst_count: {rc_burst}
+"""
+content = content.rstrip() + "\n" + rc_block
+
+with open(yaml_path, "w") as f:
+    f.write(content)
+print(f"Applied settings: federation={federation_enabled} registration={open_registration}")
 PYEOF
 
-# ---------------------------------------------------------------------------
-# Apply registration setting from openhost_settings.json
-# ---------------------------------------------------------------------------
-if [ "$OPEN_REGISTRATION" = "true" ]; then
-    if grep -q "^enable_registration:" "$DATA_DIR/homeserver.yaml"; then
-        sed -i "s|^enable_registration:.*|enable_registration: true|" "$DATA_DIR/homeserver.yaml"
-    else
-        echo "enable_registration: true" >> "$DATA_DIR/homeserver.yaml"
-    fi
-    if grep -q "^enable_registration_without_verification:" "$DATA_DIR/homeserver.yaml"; then
-        sed -i "s|^enable_registration_without_verification:.*|enable_registration_without_verification: true|" "$DATA_DIR/homeserver.yaml"
-    else
-        echo "enable_registration_without_verification: true" >> "$DATA_DIR/homeserver.yaml"
-    fi
-else
-    if grep -q "^enable_registration:" "$DATA_DIR/homeserver.yaml"; then
-        sed -i "s|^enable_registration:.*|enable_registration: false|" "$DATA_DIR/homeserver.yaml"
-    else
-        echo "enable_registration: false" >> "$DATA_DIR/homeserver.yaml"
-    fi
-    if grep -q "^enable_registration_without_verification:" "$DATA_DIR/homeserver.yaml"; then
-        sed -i "s|^enable_registration_without_verification:.*|enable_registration_without_verification: false|" "$DATA_DIR/homeserver.yaml"
-    else
-        echo "enable_registration_without_verification: false" >> "$DATA_DIR/homeserver.yaml"
-    fi
-fi
-
-# Always ensure relaxed rate limits (small personal server)
-if ! grep -q "^rc_login:" "$DATA_DIR/homeserver.yaml"; then
-    cat >> "$DATA_DIR/homeserver.yaml" <<EOF
-
-# Relaxed rate limits for personal server
-rc_login:
-  address:
-    per_second: 10
-    burst_count: 50
-  account:
-    per_second: 10
-    burst_count: 50
-  failed_attempts:
-    per_second: 10
-    burst_count: 50
-EOF
-fi
-
 # Ensure the SQLite database path points to persistent storage.
-# Synapse defaults to /data/homeserver.db — redirect it.
 if grep -q "^database:" "$DATA_DIR/homeserver.yaml"; then
     if grep -q "/data/homeserver.db" "$DATA_DIR/homeserver.yaml"; then
         sed -i "s|/data/homeserver.db|$DATA_DIR/homeserver.db|g" "$DATA_DIR/homeserver.yaml"
@@ -300,16 +314,145 @@ echo "well-known: client_base=${PUBLIC_BASEURL}"
 # Fix ownership for the host user (UID 1000)
 chown -R 1000:1000 "$DATA_DIR" 2>/dev/null || true
 
-# Start Caddy in background — it serves .well-known, rewrites Host from
-# X-Forwarded-Host, and proxies to Synapse on port 8008.
+# ---------------------------------------------------------------------------
+# Start Caddy (serves /, /_openhost/*, .well-known, proxies Matrix to Synapse)
+# ---------------------------------------------------------------------------
 caddy run --config /app/Caddyfile &
 CADDY_PID=$!
 echo "Caddy started (PID $CADDY_PID)"
 
-# Start the admin UI in background
-OPENHOST_APP_DATA_DIR="$DATA_DIR" python3 /app/admin.py &
+# ---------------------------------------------------------------------------
+# Start Go admin server
+# The admin server reads/writes DATA_DIR and sends SIGHUP to Synapse.
+# It also handles /_openhost/admin/* and / (which Caddy proxies to it).
+# ---------------------------------------------------------------------------
+OPENHOST_APP_DATA_DIR="$DATA_DIR" /app/admin-server &
 ADMIN_PID=$!
-echo "Admin UI started (PID $ADMIN_PID)"
+echo "Admin server started (PID $ADMIN_PID)"
+
+# ---------------------------------------------------------------------------
+# synapse_login PASSWORD: logs into Synapse as openhost-admin and prints the
+# access token to stdout. Credentials are passed via environment to avoid
+# exposing them in /proc/<pid>/cmdline.
+# ---------------------------------------------------------------------------
+synapse_login() {
+    ADMIN_PASS="$1" python3 << 'LOGINPY'
+import json, os, urllib.request, sys
+try:
+    pw = os.environ['ADMIN_PASS']
+    payload = json.dumps({
+        'type': 'm.login.password',
+        'user': 'openhost-admin',
+        'password': pw,
+    }).encode()
+    req = urllib.request.Request(
+        'http://127.0.0.1:8008/_matrix/client/v3/login',
+        data=payload,
+        headers={'Content-Type': 'application/json'}
+    )
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read())
+        print(data.get('access_token', ''))
+except Exception as e:
+    sys.stderr.write('synapse_login error: ' + str(e) + '\n')
+LOGINPY
+}
+
+# ---------------------------------------------------------------------------
+# Wait for Synapse to start, then provision an admin token for the admin UI.
+# This is done after Synapse is running so register_new_matrix_user works.
+# ---------------------------------------------------------------------------
+provision_admin_token() {
+    echo "Waiting for Synapse to become ready..."
+    ATTEMPTS=0
+    while [ $ATTEMPTS -lt 60 ]; do
+        if curl -sf http://127.0.0.1:8008/health > /dev/null 2>&1; then
+            break
+        fi
+        sleep 2
+        ATTEMPTS=$((ATTEMPTS + 1))
+    done
+
+    if [ $ATTEMPTS -ge 60 ]; then
+        echo "ERROR: Synapse did not start within 120s, skipping admin token provisioning"
+        return 1
+    fi
+
+    if [ ! -f "$ADMIN_TOKEN_FILE" ] || [ ! -s "$ADMIN_TOKEN_FILE" ]; then
+        echo "Provisioning admin token..."
+        ADMIN_PASS=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c "import uuid; print(str(uuid.uuid4()))")
+
+        if [ -z "$ADMIN_PASS" ]; then
+            echo "ERROR: could not generate admin password"
+            return 1
+        fi
+
+        # Try to register the admin user — pass password via environment to avoid
+        # exposing it in /proc/<pid>/cmdline.
+        # Note: register_new_matrix_user passes -p to argv of a subprocess, which
+        # is visible in that child's cmdline. This is a known limitation of the
+        # Synapse tooling; the password is only used once during first boot.
+        ADMIN_PASS="$ADMIN_PASS" DATA_DIR="$DATA_DIR" python3 << 'REGPY'
+import os, subprocess, sys
+pw = os.environ['ADMIN_PASS']
+data_dir = os.environ['DATA_DIR']
+result = subprocess.run(
+    ['register_new_matrix_user',
+     '-c', data_dir + '/homeserver.yaml',
+     '-u', 'openhost-admin',
+     '-p', pw,
+     '--admin',
+     'http://127.0.0.1:8008'],
+    capture_output=True, text=True
+)
+print(result.stdout, end='')
+if result.returncode != 0:
+    # It's expected to fail if user already exists
+    if 'already taken' not in result.stderr and 'already registered' not in result.stderr:
+        sys.stderr.write('register_new_matrix_user failed: ' + result.stderr + '\n')
+        sys.exit(1)
+    else:
+        sys.stderr.write('openhost-admin user already exists, skipping registration\n')
+REGPY
+        # Log in to get an access token — pass password via env
+        TOKEN=$(synapse_login "$ADMIN_PASS")
+
+        if [ -n "$TOKEN" ]; then
+            # Write with restricted permissions atomically to avoid TOCTOU race
+            (umask 077; printf '%s' "$TOKEN" > "$ADMIN_TOKEN_FILE")
+            (umask 077; printf '%s' "$ADMIN_PASS" > "$DATA_DIR/admin_password")
+            echo "Admin token provisioned successfully"
+        else
+            echo "Warning: could not provision admin token — user management features may be limited"
+        fi
+    else
+        echo "Admin token already exists"
+
+        # Re-validate the token — if expired, re-login using stored password
+        EXISTING_TOKEN=$(cat "$ADMIN_TOKEN_FILE")
+        HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $EXISTING_TOKEN" \
+            "http://127.0.0.1:8008/_synapse/admin/v2/users?limit=1" 2>/dev/null || echo "000")
+        if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Admin token invalid (status $HTTP_STATUS), re-logging in..."
+            STORED_PASS=$(cat "$DATA_DIR/admin_password" 2>/dev/null || echo "")
+            if [ -n "$STORED_PASS" ]; then
+                TOKEN=$(synapse_login "$STORED_PASS")
+                if [ -n "$TOKEN" ]; then
+                    (umask 077; printf '%s' "$TOKEN" > "$ADMIN_TOKEN_FILE")
+                    echo "Admin token refreshed"
+                else
+                    echo "Warning: could not refresh admin token"
+                fi
+            else
+                echo "Warning: no stored password, cannot refresh admin token"
+            fi
+        fi
+    fi
+}
+
+# Provision admin token in background after Synapse starts
+provision_admin_token &
 
 # Hand off to the official Synapse entrypoint
 echo "Starting Synapse..."
