@@ -172,18 +172,15 @@ type UserList struct {
 }
 
 // ListUsers returns a page of users.
-// Note: the guests parameter is not supported when Synapse delegates to MAS
-// (matrix_authentication_service.enabled: true), so we omit it when including
-// guests is the default behavior.
+// Note: the guests parameter (both guests=true and guests=false) is not supported
+// when Synapse delegates authentication to MAS. We never send it to ensure
+// compatibility with both standalone Synapse and MAS-enabled Synapse.
 func (c *Client) ListUsers(from int, limit int, guestsIncluded bool, searchTerm string) (*UserList, error) {
 	params := url.Values{}
 	params.Set("from", strconv.Itoa(from))
 	params.Set("limit", strconv.Itoa(limit))
-	// Only set guests=false when explicitly excluding; don't set guests=true
-	// as it's unsupported when MAS delegation is active.
-	if !guestsIncluded {
-		params.Set("guests", "false")
-	}
+	// Do not send the guests parameter — unsupported when MAS is active.
+	// With MAS, guest accounts are not used, so this is acceptable.
 	if searchTerm != "" {
 		params.Set("name", searchTerm)
 	}
