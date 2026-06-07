@@ -262,7 +262,8 @@ func (h *handler) userDeactivate(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) userPromote(w http.ResponseWriter, r *http.Request) {
 	userID := r.PathValue("userID")
-	admin := r.URL.Query().Get("admin") != "false"
+	// Require explicit "true" to grant admin — any other value (including missing) revokes.
+	admin := r.URL.Query().Get("admin") == "true"
 
 	type result struct{ Error, Message string }
 	if err := h.syn.PromoteUser(userID, admin); err != nil {

@@ -12,7 +12,7 @@ import (
 )
 
 // reloadSynapse sends SIGHUP to all Synapse processes so they reload config
-// without a full restart. Returns nil on success.
+// without a full restart. Returns nil only if at least one SIGHUP was delivered.
 func reloadSynapse() error {
 	pids, err := findSynapsePIDs()
 	if err != nil {
@@ -21,6 +21,7 @@ func reloadSynapse() error {
 	if len(pids) == 0 {
 		return fmt.Errorf("no synapse processes found")
 	}
+	signaled := 0
 	for _, pid := range pids {
 		proc, err := os.FindProcess(pid)
 		if err != nil {
@@ -31,7 +32,11 @@ func reloadSynapse() error {
 			log.Printf("reload: SIGHUP pid %d: %v", pid, err)
 		} else {
 			log.Printf("reload: sent SIGHUP to pid %d", pid)
+			signaled++
 		}
+	}
+	if signaled == 0 {
+		return fmt.Errorf("failed to signal any of %d synapse process(es)", len(pids))
 	}
 	// Brief pause to let Synapse start reloading before we respond
 	time.Sleep(500 * time.Millisecond)

@@ -244,12 +244,14 @@ content = set_yaml_value(content, "max_upload_size", f"{max_upload_mb}M")
 
 # Federation listener
 def patch_federation_listener(content, enabled):
+    # Group 1 captures everything UP TO but NOT including the '[',
+    # so the replacement can safely emit the full '[...]' list.
     def replace_names(m):
-        prefix = m.group(1)
+        prefix = m.group(1)  # e.g. "      - names: " (no trailing '[')
         if enabled:
             return prefix + "[client, federation]"
         return prefix + "[client]"
-    pattern = re.compile(r'((?:-\s+)?names:\s*\[)client(?:,\s*federation)?\]')
+    pattern = re.compile(r'((?:-\s+)?names:\s*)\[client(?:,\s*federation)?\]')
     return pattern.sub(replace_names, content)
 
 content = patch_federation_listener(content, federation_enabled)
@@ -287,7 +289,8 @@ rc_block = f"""rc_login:
 """
 content = content.rstrip() + "\n" + rc_block
 
-open(yaml_path, "w").write(content)
+with open(yaml_path, "w") as f:
+    f.write(content)
 print(f"Applied settings: federation={federation_enabled} registration={open_registration}")
 PYEOF
 
@@ -349,6 +352,9 @@ provision_admin_token() {
 
         # Try to register the admin user — pass password via environment to avoid
         # exposing it in /proc/<pid>/cmdline.
+        # Note: register_new_matrix_user passes -p to argv of a subprocess, which
+        # is visible in that child's cmdline. This is a known limitation of the
+        # Synapse tooling; the password is only used once during first boot.
         ADMIN_PASS="$ADMIN_PASS" DATA_DIR="$DATA_DIR" python3 << 'REGPY'
 import os, subprocess, sys
 pw = os.environ['ADMIN_PASS']
@@ -364,7 +370,12 @@ result = subprocess.run(
 )
 print(result.stdout, end='')
 if result.returncode != 0:
-    sys.stderr.write(result.stderr + '\n')
+    # It's expected to fail if user already exists
+    if 'already taken' not in result.stderr and 'already registered' not in result.stderr:
+        sys.stderr.write('register_new_matrix_user failed: ' + result.stderr + '\n')
+        sys.exit(1)
+    else:
+        sys.stderr.write('openhost-admin user already exists, skipping registration\n')
 REGPY
         # Log in to get an access token — pass password via env
         TOKEN=$(ADMIN_PASS="$ADMIN_PASS" python3 << 'LOGINPY'
