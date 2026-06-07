@@ -172,15 +172,16 @@ type UserList struct {
 }
 
 // ListUsers returns a page of users.
-// Note: the guests parameter (both guests=true and guests=false) is not supported
-// when Synapse delegates authentication to MAS. We never send it to ensure
-// compatibility with both standalone Synapse and MAS-enabled Synapse.
+// When Synapse delegates to MAS, the guests default is true which is not supported.
+// We always send guests=false to override the default — this works both with
+// standalone Synapse and MAS-enabled Synapse (MAS doesn't support guest accounts).
 func (c *Client) ListUsers(from int, limit int, guestsIncluded bool, searchTerm string) (*UserList, error) {
 	params := url.Values{}
 	params.Set("from", strconv.Itoa(from))
 	params.Set("limit", strconv.Itoa(limit))
-	// Do not send the guests parameter — unsupported when MAS is active.
-	// With MAS, guest accounts are not used, so this is acceptable.
+	// Always send guests=false: when MAS is active, the default (guests=true) raises an error.
+	// Guest accounts are not used with MAS, so this is always correct behavior.
+	params.Set("guests", "false")
 	if searchTerm != "" {
 		params.Set("name", searchTerm)
 	}
@@ -389,9 +390,9 @@ type Stats struct {
 func (c *Client) GetStats() (*Stats, error) {
 	s := &Stats{}
 
-	// Total users: omit guests parameter — not supported when MAS delegation is active.
-	// This returns all users by default (including guests if any).
-	usersData, err := c.get(adminPathV2 + "/users?limit=1")
+	// Total users with guests=false: required to override the default (guests=true)
+	// which causes an error when MAS delegation is active.
+	usersData, err := c.get(adminPathV2 + "/users?limit=1&guests=false")
 	if err == nil {
 		var resp struct {
 			Total int `json:"total"`
