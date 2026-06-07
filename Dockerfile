@@ -1,7 +1,7 @@
 FROM matrixdotorg/synapse:latest AS synapse-base
 
 # ---- Pull MAS binary and assets from the official image ----
-FROM ghcr.io/element-hq/matrix-authentication-service:v1.18.0 AS mas-source
+FROM ghcr.io/element-hq/matrix-authentication-service:1.18.0 AS mas-source
 
 # ---- Build the Go admin server ----
 FROM golang:1.22-bookworm AS go-builder
