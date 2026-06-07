@@ -87,7 +87,7 @@ func (h *handler) statsPartial(w http.ResponseWriter, r *http.Request) {
 	}
 
 	version, _ := h.syn.ServerVersion()
-	users, err := h.syn.ListUsers(0, 1, false, "")
+	users, err := h.syn.ListUsers(0, 1, true, "")
 
 	data := statsData{Version: version}
 	if err != nil || users == nil {

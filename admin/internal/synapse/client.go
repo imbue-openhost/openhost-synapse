@@ -387,7 +387,7 @@ type Stats struct {
 func (c *Client) GetStats() (*Stats, error) {
 	s := &Stats{}
 
-	// Total users: the /v2/users endpoint returns a total field even with limit=1
+	// Total non-guest users: guests=false gives the count of non-guest accounts
 	usersData, err := c.get(adminPathV2 + "/users?limit=1&guests=false")
 	if err == nil {
 		var resp struct {
@@ -395,6 +395,16 @@ func (c *Client) GetStats() (*Stats, error) {
 		}
 		if err := json.Unmarshal(usersData, &resp); err == nil {
 			s.TotalNonGuests = resp.Total
+		}
+	}
+
+	// Total users including guests
+	allUsersData, err := c.get(adminPathV2 + "/users?limit=1&guests=true")
+	if err == nil {
+		var resp struct {
+			Total int `json:"total"`
+		}
+		if err := json.Unmarshal(allUsersData, &resp); err == nil {
 			s.TotalUsers = resp.Total
 		}
 	}
