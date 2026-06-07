@@ -5,19 +5,39 @@ Matrix Synapse homeserver for OpenHost. Runs as a single Docker container:
 - Open registration enabled by default (no email verification required)
 - SQLite database (no external database required)
 - Persistent data in OpenHost's app_data directory
+- Admin UI at `/_openhost/admin` for managing federation and registration
 
 ## How it works
 
 On first boot, the container:
 1. Generates a `homeserver.yaml` config with the server name derived from OpenHost environment variables (`<app_name>.<zone_domain>`, e.g. `synapse.andrew.host.imbue.com`)
 2. Generates signing keys
-3. Enables open registration without email verification
-4. Disables the federation listener (removes `federation` from the listener names list) and blocks federation via an empty `federation_domain_whitelist`
+3. Creates `openhost_settings.json` with default settings (federation disabled, open registration enabled)
+4. Applies settings from `openhost_settings.json` to `homeserver.yaml`
 5. Appends relaxed rate limits suitable for a small personal server
 6. Generates a Caddyfile with a `.well-known/matrix/client` response for client auto-discovery
-7. Starts Caddy (serves well-known, rewrites Host from X-Forwarded-Host, proxies to Synapse on port 8008) and Synapse
+7. Starts Caddy (serves well-known, routes admin UI, rewrites Host from X-Forwarded-Host, proxies to Synapse on port 8008), the admin UI, and Synapse
 
-On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` in the existing config but does not regenerate from scratch.
+On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` and re-applies all settings from `openhost_settings.json`.
+
+## Admin UI
+
+Settings for federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
+
+The UI has two toggles:
+
+- **Open Registration** — allow anyone to create an account without an invitation
+- **Federation** — allow this server to communicate with other Matrix homeservers
+
+On save, the admin UI updates `openhost_settings.json` and patches `homeserver.yaml`. A restart of the app is required for the changes to take effect (Synapse's SIGHUP only reloads log config, not registration or federation settings).
+
+Settings are stored in `$OPENHOST_APP_DATA_DIR/openhost_settings.json`:
+```json
+{
+  "federation_enabled": false,
+  "open_registration": true
+}
+```
 
 ## Federation
 
@@ -28,13 +48,13 @@ Federation is **disabled** by default. The start script does two things to ensur
 
 The Caddyfile only serves `/.well-known/matrix/client` for client auto-discovery. There is no `/.well-known/matrix/server` endpoint. Port 8448 (the standard Matrix federation port) is not exposed.
 
-To enable federation, you would need to edit `homeserver.yaml` in the app data directory **and** modify `start.sh` to stop overwriting the federation settings on each boot. This is not a supported configuration today.
+To enable federation, use the admin UI at `/_openhost/admin`.
 
 ## Registration
 
-Open registration is enabled on first boot (`enable_registration: true` and `enable_registration_without_verification: true` in `homeserver.yaml`). Anyone who can reach the Matrix client API can create an account without email verification.
+Open registration is enabled by default. Anyone who can reach the Matrix client API can create an account without email verification.
 
-To disable registration, edit `homeserver.yaml` in the app data directory and set `enable_registration: false`. This change persists across restarts since `start.sh` only sets this value on first boot.
+To disable registration, use the admin UI at `/_openhost/admin`.
 
 The first user to register can be promoted to admin via the Synapse admin API or by editing the database directly.
 
@@ -54,6 +74,7 @@ Connect with any Matrix client (Element, FluffyChat, etc.) using your server URL
 
 All persistent data lives in `$OPENHOST_APP_DATA_DIR/`:
 - `homeserver.yaml` -- Synapse configuration (regenerated on first boot, patched on subsequent boots)
+- `openhost_settings.json` -- Admin UI settings (source of truth for federation and registration)
 - `*.signing.key` -- Signing keys (back these up; losing them breaks room continuity)
 - `homeserver.db` -- SQLite database (users, rooms, messages, etc.)
 - `media_store/` -- Uploaded media and thumbnails
@@ -69,31 +90,29 @@ The following paths are publicly accessible (no OpenHost zone auth required):
 - `/_synapse/client/` -- Synapse-specific client endpoints (registration, password reset)
 - `/.well-known/matrix/` -- Matrix client discovery
 
-All other paths require OpenHost authentication.
+All other paths (including `/_openhost/admin`) require OpenHost authentication.
 
 ## Configuration
 
 `start.sh` auto-configures Synapse at runtime. Settings applied on first boot:
 - `server_name` derived from `OPENHOST_ZONE_DOMAIN` and `OPENHOST_APP_NAME`
 - `public_baseurl` set for correct URL generation
-- Client-only listener on port 8008 (federation listener removed)
-- `federation_domain_whitelist: []` (federation blocked)
-- `enable_registration: true` and `enable_registration_without_verification: true`
 - SQLite database at `$OPENHOST_APP_DATA_DIR/homeserver.db`
 - Relaxed rate limits (`rc_login` set to 10/s with burst of 50)
 
-Settings patched on every boot (even if `homeserver.yaml` already exists):
+Settings applied on every boot from `openhost_settings.json`:
 - `public_baseurl` (updated to match the current domain)
 - `media_store_path` (pointed at persistent storage)
-- Federation listener removal (re-applied if the config still has `client, federation`)
-- `federation_domain_whitelist: []` (appended if not present)
+- Federation listener and `federation_domain_whitelist` (from `federation_enabled` setting)
+- `enable_registration` and `enable_registration_without_verification` (from `open_registration` setting)
 - Rate limits (appended if not present)
 
-To customize settings, edit `homeserver.yaml` in the app's data directory. Be aware that the settings listed above as "patched on every boot" will be reapplied by `start.sh` on restart, so changes to those specific values will be overwritten.
+To change federation or registration settings, use the admin UI. Direct edits to `homeserver.yaml` for these values will be overwritten on next boot.
 
 ## Files
 
-- `Dockerfile` -- extends the official Synapse image with Caddy for Host header rewriting and .well-known serving
-- `start.sh` -- generates config on first boot, patches config on subsequent boots, starts Caddy and Synapse
-- `Caddyfile.template` -- Caddy config template; start.sh substitutes server name and base URL at runtime. Serves `.well-known/matrix/client` and reverse-proxies to Synapse on port 8008
+- `Dockerfile` -- extends the official Synapse image with Caddy and Flask for the admin UI
+- `start.sh` -- generates config on first boot, applies settings from `openhost_settings.json` on every boot, starts Caddy, admin UI, and Synapse
+- `Caddyfile.template` -- Caddy config template; routes `/_openhost/admin` to the admin UI and proxies everything else to Synapse
+- `admin.py` -- Flask app serving the admin UI on port 8009
 - `openhost.toml` -- OpenHost app manifest (2048 MB RAM, 2 CPU cores, app_data storage)
