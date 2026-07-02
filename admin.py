@@ -516,8 +516,20 @@ def _get_admin_token() -> str:
             app.logger.warning("admin re-login failed, will try re-register: %s", exc)
 
     # First-time setup: register the service account and store its credentials.
+    # If the account already exists but our stored credentials are gone/wrong
+    # (e.g. openhost_sso.json was lost or corrupted), re-registration 400s. Surface
+    # a clear, actionable error rather than a raw Synapse 400.
     password = _generate_password()
-    result = _shared_secret_register(SSO_ADMIN_USER, password, admin=True)
+    try:
+        result = _shared_secret_register(SSO_ADMIN_USER, password, admin=True)
+    except SSOError as exc:
+        if "M_USER_IN_USE" in str(exc) or "User ID already taken" in str(exc):
+            raise SSOError(
+                f"SSO admin account '{SSO_ADMIN_USER}' exists but its stored credentials "
+                f"({SSO_STATE_FILE.name}) are missing or invalid. Remove that account or "
+                "restore the credentials file to recover."
+            ) from exc
+        raise
     token = result["access_token"]
     _save_sso_state(
         {
@@ -844,7 +856,7 @@ def community_onboarding():
         # takes effect after an app restart (SIGHUP doesn't reliably reload it),
         # so we can't reliably join in this same request. Instead we record the
         # intent + turn federation on, and the join is completed on the next boot
-        # by start.sh (see _complete_pending_community_join).
+        # by the background worker in this module (see _complete_pending_community_join).
         if join_community and room_alias:
             settings = load_settings()
             settings["federation_enabled"] = True
@@ -854,6 +866,15 @@ def community_onboarding():
                 apply_settings_to_yaml(settings)
             except OSError as exc:
                 app.logger.error("could not apply federation setting: %s", exc)
+                # Don't claim success if we couldn't patch homeserver.yaml.
+                return render_template_string(
+                    ONBOARDING_TEMPLATE,
+                    error="Enabled chat, but could not turn on federation to join the "
+                    f"community: {exc}. You can retry from the admin console.",
+                    suggested=username,
+                    server_name=server,
+                    community_room_alias=room_alias,
+                )
             # Federation only activates on restart; the join then completes
             # automatically in the background. Tell the owner to restart.
             return render_template_string(
@@ -914,12 +935,17 @@ def _complete_pending_community_join() -> None:
         return
 
     # Wait for Synapse's client API to be reachable (up to ~2 min).
+    reachable = False
     for _ in range(60):
         try:
             _synapse_request("GET", "/_matrix/client/versions")
+            reachable = True
             break
         except SSOError:
             time.sleep(2)
+    if not reachable:
+        app.logger.error("pending community join: Synapse never became reachable; retry next boot")
+        return
 
     # Retry the join a handful of times within this boot: a remote (federated)
     # alias may not resolve immediately after Synapse starts (federation/DNS
