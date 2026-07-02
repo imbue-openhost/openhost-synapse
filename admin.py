@@ -747,8 +747,8 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
     <div class="card">
       <label for="username">Choose your chat username</label>
       <input type="text" id="username" name="username" value="{{ suggested }}"
-             pattern="[a-z0-9._=/-]+" required autocomplete="off">
-      <p class="hint">Lowercase letters, numbers, and . _ = / - only. Your Matrix
+             pattern="[a-z0-9._=-]+" required autocomplete="off">
+      <p class="hint">Lowercase letters, numbers, and . _ = - only. Your Matrix
          address will be <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
       <label class="consent">
         <input type="checkbox" name="consent" value="1" required>
@@ -805,7 +805,10 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
 </div></body></html>
 """
 
-_USERNAME_RE = re.compile(r"^[a-z0-9._=/-]+$")
+# Matrix localpart grammar technically allows a wider set, but Synapse's default
+# user_id validation is stricter and '/' in particular breaks account creation and
+# URL handling. Restrict to the safe, portable subset.
+_USERNAME_RE = re.compile(r"^[a-z0-9._=-]+$")
 
 
 @app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
@@ -835,7 +838,7 @@ def community_onboarding():
         if not consent:
             error = "Please confirm you understand before enabling."
         elif not username or not _USERNAME_RE.match(username) or username.startswith("_"):
-            error = "Invalid username. Use lowercase letters, numbers, and . _ = / - (not starting with _)."
+            error = "Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
         if error:
             return render_template_string(
                 ONBOARDING_TEMPLATE,
