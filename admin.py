@@ -43,6 +43,10 @@ DEFAULTS = {
     "open_registration": True,
     "community_enabled": False,
     "community_onboarded": False,
+    "community_joined": False,
+    # The single string defining which room the "join the community" flow joins,
+    # e.g. "#openhost-community:hub.example.com". Empty = no community configured.
+    "community_room_alias": "",
 }
 
 # ---------------------------------------------------------------------------
@@ -621,6 +625,22 @@ def save():
     )
 
 
+def _join_community_room(username: str, room_alias: str) -> str:
+    """Join the owner's account to a (federated) room by alias. Returns room_id.
+
+    Federation must already be enabled and active for a remote alias to resolve.
+    """
+    session = sso_login_for_owner(username)
+    token = session["access_token"]
+    # POST /join/{roomIdOrAlias} resolves the alias (over federation if remote)
+    # and joins. Idempotent: joining an already-joined room returns the room_id.
+    import urllib.parse
+
+    quoted = urllib.parse.quote(room_alias, safe="")
+    resp = _synapse_request("POST", f"/_matrix/client/v3/join/{quoted}", token=token, body={})
+    return resp.get("room_id", "")
+
+
 def _owner_matrix_username() -> str:
     """The Matrix localpart for the OpenHost owner. Configurable via onboarding;
     falls back to a stable default."""
@@ -711,8 +731,52 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
               and I want to enable it.</span>
       </label>
     </div>
+
+    {% if community_room_alias %}
+    <div class="card">
+      <h2>Join the OpenHost community?</h2>
+      <p>Optionally join the OpenHost community room
+         (<code>{{ community_room_alias }}</code>) to chat with other OpenHost
+         users. This <strong>enables federation</strong> so your server can reach
+         the community's server — review the considerations above first. You can
+         also do this later, or leave it off to keep your server fully private.</p>
+      <label class="consent">
+        <input type="checkbox" name="join_community" value="1">
+        <span>Yes, enable federation and join the OpenHost community room.</span>
+      </label>
+    </div>
+    {% endif %}
+
     <button type="submit" class="btn">Enable community chat</button>
   </form>
+</div></body></html>
+"""
+
+JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Almost there</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
+  .container{max-width:560px;margin:0 auto}
+  h1{color:#f8fafc;font-size:1.5rem}
+  .card{background:#1e2130;border:1px solid #2d3348;border-radius:.75rem;padding:1.5rem;margin-top:1rem}
+  p,li{color:#cbd5e1;line-height:1.55}
+  code{color:#a5b4fc}
+  a.btn{display:inline-block;margin-top:1rem;padding:.6rem 1rem;background:#6366f1;color:#fff;border-radius:.5rem;text-decoration:none}
+</style></head>
+<body><div class="container">
+  <h1>Community chat is enabled</h1>
+  <div class="card">
+    <p>You opted to join the OpenHost community room
+       (<code>{{ room_alias }}</code>). This turned on <strong>federation</strong>.</p>
+    <p><strong>Restart this app</strong> from your OpenHost dashboard to activate
+       federation. Once it restarts, your server will join the community room
+       automatically in the background.</p>
+    <p>You can start using chat now; the community room will appear after the
+       restart completes.</p>
+    <a class="btn" href="/_openhost/community/login">Open chat</a>
+  </div>
 </div></body></html>
 """
 
@@ -736,9 +800,12 @@ def community_onboarding():
     except SSOError:
         pass
 
+    room_alias = settings.get("community_room_alias", "")
+
     if request.method == "POST":
         username = (request.form.get("username") or "").strip().lower()
         consent = request.form.get("consent") == "1"
+        join_community = request.form.get("join_community") == "1"
         error = None
         if not consent:
             error = "Please confirm you understand before enabling."
@@ -746,16 +813,47 @@ def community_onboarding():
             error = "Invalid username. Use lowercase letters, numbers, and . _ = / - (not starting with _)."
         if error:
             return render_template_string(
-                ONBOARDING_TEMPLATE, error=error, suggested=username, server_name=server
+                ONBOARDING_TEMPLATE,
+                error=error,
+                suggested=username,
+                server_name=server,
+                community_room_alias=room_alias,
             )
-        settings = load_settings()
         settings["community_username"] = username
         settings["community_onboarded"] = True
         save_settings(settings)
+
+        # Explicit, opt-in community join: only if the owner ticked the box AND a
+        # room alias is configured. Never automatic.
+        #
+        # Joining a *remote* (federated) room alias requires federation to be
+        # enabled AND active in the running Synapse. Enabling federation only
+        # takes effect after an app restart (SIGHUP doesn't reliably reload it),
+        # so we can't reliably join in this same request. Instead we record the
+        # intent + turn federation on, and the join is completed on the next boot
+        # by start.sh (see _complete_pending_community_join).
+        if join_community and room_alias:
+            settings = load_settings()
+            settings["federation_enabled"] = True
+            settings["community_join_pending"] = True
+            save_settings(settings)
+            try:
+                apply_settings_to_yaml(settings)
+            except OSError as exc:
+                app.logger.error("could not apply federation setting: %s", exc)
+            # Federation only activates on restart; the join then completes
+            # automatically in the background. Tell the owner to restart.
+            return render_template_string(
+                JOIN_PENDING_TEMPLATE, room_alias=room_alias
+            )
         return redirect("/_openhost/community/login", code=302)
 
     return render_template_string(
-        ONBOARDING_TEMPLATE, error=None, suggested="owner", server_name=server
+        ONBOARDING_TEMPLATE,
+        error=None,
+        suggested="owner",
+        server_name=server,
+        community_room_alias=room_alias,
     )
 
 
@@ -788,6 +886,43 @@ def community_login():
     )
 
 
+def _complete_pending_community_join() -> None:
+    """Background worker: if a community join is pending (federation was just
+    enabled during onboarding), wait for Synapse to come up, join the configured
+    room over federation, and clear the pending flag. Runs once per boot."""
+    import time
+
+    settings = load_settings()
+    if not settings.get("community_join_pending"):
+        return
+    room_alias = settings.get("community_room_alias", "")
+    username = settings.get("community_username") or "owner"
+    if not room_alias:
+        return
+
+    # Wait for Synapse's client API to be reachable (up to ~2 min).
+    for _ in range(60):
+        try:
+            _synapse_request("GET", "/_matrix/client/versions")
+            break
+        except SSOError:
+            time.sleep(2)
+
+    try:
+        room_id = _join_community_room(username, room_alias)
+        settings = load_settings()
+        settings["community_joined"] = True
+        settings["community_join_pending"] = False
+        save_settings(settings)
+        app.logger.info("joined community room %s (%s)", room_alias, room_id)
+    except SSOError as exc:
+        # Leave the pending flag set so it retries on the next boot.
+        app.logger.error("pending community join failed (will retry next boot): %s", exc)
+
+
 if __name__ == "__main__":
+    import threading
+
+    threading.Thread(target=_complete_pending_community_join, daemon=True).start()
     port = int(os.environ.get("ADMIN_PORT", "8009"))
     app.run(host="127.0.0.1", port=port, debug=False)

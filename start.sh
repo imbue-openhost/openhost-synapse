@@ -28,7 +28,9 @@ if [ ! -f "$SETTINGS_FILE" ]; then
   "federation_enabled": false,
   "open_registration": true,
   "community_enabled": false,
-  "community_onboarded": false
+  "community_onboarded": false,
+  "community_joined": false,
+  "community_room_alias": ""
 }
 EOF
     echo "Created default settings: $SETTINGS_FILE"
@@ -66,6 +68,25 @@ except Exception as e:
     sys.stderr.write('Warning: could not read settings file: ' + str(e) + '\n')
     print('false')
 ")
+
+# Seed the community room alias from an env var on first boot if unset. This is
+# the single string that defines which room the "join the community" flow joins,
+# e.g. "#openhost-community:hub.example.com". Kept in settings so it can also be
+# managed later without redeploying.
+if [ -n "$OPENHOST_COMMUNITY_ROOM_ALIAS" ]; then
+    python3 - "$SETTINGS_FILE" "$OPENHOST_COMMUNITY_ROOM_ALIAS" <<'PYEOF'
+import json, sys
+path, alias = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(path))
+except Exception:
+    d = {}
+if not d.get("community_room_alias"):
+    d["community_room_alias"] = alias
+    json.dump(d, open(path, "w"), indent=2)
+    print(f"Seeded community_room_alias={alias}")
+PYEOF
+fi
 
 echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION community_enabled=$COMMUNITY_ENABLED"
 
