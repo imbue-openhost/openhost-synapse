@@ -10,20 +10,31 @@ Settings are persisted to openhost_settings.json in the Synapse data dir.
 On change, homeserver.yaml is patched and Synapse is sent SIGHUP to reload.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
 import signal
-import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from flask import Flask, redirect, render_template_string, request, url_for
+from flask import Flask, render_template_string, request
 
 app = Flask(__name__)
 
 DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data"))
 SETTINGS_FILE = DATA_DIR / "openhost_settings.json"
 HOMESERVER_YAML = DATA_DIR / "homeserver.yaml"
+
+# Synapse listens on localhost:8008 inside the container. The admin/SSO code
+# talks to it directly here, bypassing the OpenHost router + zone_auth (which
+# only gates the public-facing subdomain, not intra-container localhost calls).
+SYNAPSE_BASE = os.environ.get("SYNAPSE_LOCAL_URL", "http://localhost:8008")
+# Where we persist the SSO service account's admin access token.
+SSO_STATE_FILE = DATA_DIR / "openhost_sso.json"
+SSO_ADMIN_USER = "_openhost_sso_admin"
 
 DEFAULTS = {
     "federation_enabled": False,
@@ -361,6 +372,157 @@ TEMPLATE = """<!DOCTYPE html>
 
 
 # ---------------------------------------------------------------------------
+# Matrix SSO — mint a Matrix session for the OpenHost owner so the bundled
+# web client starts logged in. All Synapse calls go to localhost:8008 (inside
+# the container), so they are not subject to the router's zone_auth.
+# ---------------------------------------------------------------------------
+
+
+class SSOError(Exception):
+    pass
+
+
+def _synapse_request(method: str, path: str, token: str | None = None, body: dict | None = None) -> dict:
+    url = f"{SYNAPSE_BASE}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise SSOError(f"Synapse {method} {path} -> {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise SSOError(f"Synapse {method} {path} unreachable: {exc}") from exc
+
+
+def _read_registration_shared_secret() -> str:
+    """Read registration_shared_secret from homeserver.yaml (Synapse generates one)."""
+    try:
+        content = HOMESERVER_YAML.read_text()
+    except OSError as exc:
+        raise SSOError(f"could not read homeserver.yaml: {exc}") from exc
+    m = re.search(r'^registration_shared_secret:\s*"?([^"\n]+)"?\s*$', content, flags=re.MULTILINE)
+    if not m:
+        raise SSOError("registration_shared_secret not found in homeserver.yaml")
+    return m.group(1).strip()
+
+
+def _shared_secret_register(username: str, password: str, admin: bool) -> dict:
+    """Register a user via the shared-secret admin API (nonce + HMAC)."""
+    nonce = _synapse_request("GET", "/_synapse/admin/v1/register")["nonce"]
+    secret = _read_registration_shared_secret()
+    mac = hmac.new(secret.encode(), digestmod=hashlib.sha1)
+    mac.update(nonce.encode())
+    mac.update(b"\x00")
+    mac.update(username.encode())
+    mac.update(b"\x00")
+    mac.update(password.encode())
+    mac.update(b"\x00")
+    mac.update(b"admin" if admin else b"notadmin")
+    body = {
+        "nonce": nonce,
+        "username": username,
+        "password": password,
+        "admin": admin,
+        "mac": mac.hexdigest(),
+    }
+    return _synapse_request("POST", "/_synapse/admin/v1/register", body=body)
+
+
+def _load_sso_state() -> dict:
+    if SSO_STATE_FILE.exists():
+        try:
+            return json.loads(SSO_STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_sso_state(state: dict) -> None:
+    SSO_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+    try:
+        os.chmod(SSO_STATE_FILE, 0o600)  # admin token — restrict to owner
+    except OSError:
+        pass
+
+
+def _generate_password() -> str:
+    import secrets
+    return secrets.token_urlsafe(32)
+
+
+def _get_admin_token() -> str:
+    """Return an admin access token, creating the SSO service account on first use."""
+    state = _load_sso_state()
+    token = state.get("admin_token")
+    if token:
+        # Verify it still works; whoami requires a valid token.
+        try:
+            _synapse_request("GET", "/_matrix/client/v3/account/whoami", token=token)
+            return token
+        except SSOError:
+            pass  # stale — re-register below
+    result = _shared_secret_register(SSO_ADMIN_USER, _generate_password(), admin=True)
+    token = result["access_token"]
+    _save_sso_state({"admin_token": token, "admin_user_id": result.get("user_id")})
+    return token
+
+
+def _server_name() -> str:
+    return os.environ.get("SYNAPSE_SERVER_NAME") or _read_server_name_from_yaml()
+
+
+def _read_server_name_from_yaml() -> str:
+    try:
+        content = HOMESERVER_YAML.read_text()
+        m = re.search(r'^server_name:\s*"?([^"\n]+)"?\s*$', content, flags=re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    except OSError:
+        pass
+    raise SSOError("could not determine server_name")
+
+
+def sso_login_for_owner(username: str) -> dict:
+    """Ensure the owner's Matrix user exists and mint a fresh access token for it.
+
+    Returns {user_id, access_token, device_id, home_server}.
+    """
+    admin_token = _get_admin_token()
+    server = _server_name()
+    user_id = f"@{username}:{server}"
+
+    # Idempotently ensure the user exists (admin PUT is create-or-update).
+    _synapse_request(
+        "PUT",
+        f"/_synapse/admin/v2/users/{user_id}",
+        token=admin_token,
+        body={"password": _generate_password()},
+    )
+    # Mint a login token/session for the user via the admin login API.
+    login = _synapse_request(
+        "POST",
+        f"/_synapse/admin/v1/users/{user_id}/login",
+        token=admin_token,
+        body={},
+    )
+    access_token = login["access_token"]
+    # Resolve device_id via whoami with the new token.
+    whoami = _synapse_request("GET", "/_matrix/client/v3/account/whoami", token=access_token)
+    return {
+        "user_id": user_id,
+        "access_token": access_token,
+        "device_id": whoami.get("device_id", ""),
+        "home_server": server,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -405,6 +567,55 @@ def save():
         settings=settings,
         message="Settings saved. Restart the app to apply changes." if reloaded else None,
         warning=warning,
+    )
+
+
+def _owner_matrix_username() -> str:
+    """The Matrix localpart for the OpenHost owner. Configurable via onboarding;
+    falls back to a stable default."""
+    settings = load_settings()
+    return settings.get("community_username") or "owner"
+
+
+SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Signing in…</title></head>
+<body style="background:#0f1117;color:#e2e8f0;font-family:sans-serif;text-align:center;padding-top:20vh">
+<p>Signing you in to community chat…</p>
+<script>
+try {
+  localStorage.setItem("cinny_access_token", {{ access_token|tojson }});
+  localStorage.setItem("cinny_device_id", {{ device_id|tojson }});
+  localStorage.setItem("cinny_user_id", {{ user_id|tojson }});
+  localStorage.setItem("cinny_hs_base_url", {{ hs_base_url|tojson }});
+} catch (e) {}
+window.location.replace("/");
+</script>
+</body></html>
+"""
+
+
+@app.route("/_openhost/community/login")
+def community_login():
+    """Owner SSO entrypoint: mint a Matrix session and hand it to the web client.
+
+    Only reachable by the OpenHost owner (zone_auth gates this subdomain path).
+    """
+    if not load_settings().get("community_enabled", False):
+        return "Community chat is not enabled.", 404
+    username = _owner_matrix_username()
+    try:
+        session = sso_login_for_owner(username)
+    except SSOError as exc:
+        app.logger.error("community_login: SSO failed: %s", exc)
+        return f"Could not sign in to chat: {exc}", 502
+    # Cinny expects the homeserver base URL it will talk to (same origin).
+    hs_base_url = f"https://{session['home_server']}"
+    return render_template_string(
+        SSO_BOOTSTRAP_TEMPLATE,
+        access_token=session["access_token"],
+        device_id=session["device_id"],
+        user_id=session["user_id"],
+        hs_base_url=hs_base_url,
     )
 
 

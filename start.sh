@@ -360,7 +360,7 @@ CADDY_PID=$!
 echo "Caddy started (PID $CADDY_PID)"
 
 # Start the admin UI in background
-OPENHOST_APP_DATA_DIR="$DATA_DIR" python3 /app/admin.py &
+OPENHOST_APP_DATA_DIR="$DATA_DIR" SYNAPSE_SERVER_NAME="$SERVER_NAME" python3 /app/admin.py &
 ADMIN_PID=$!
 echo "Admin UI started (PID $ADMIN_PID)"
 
