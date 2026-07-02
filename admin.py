@@ -16,6 +16,7 @@ import json
 import os
 import re
 import signal
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -556,6 +557,13 @@ def _read_server_name_from_yaml() -> str:
     raise SSOError("could not determine server_name")
 
 
+# Serialize SSO logins: the flow sets a fresh ephemeral password then logs in
+# with it, so two concurrent logins for the same owner could otherwise race
+# (one overwrites the other's password before it logs in). Logins are rare and
+# fast, so a process-wide lock is the simplest correct fix.
+_sso_lock = threading.Lock()
+
+
 def sso_login_for_owner(username: str) -> dict:
     """Ensure the owner's Matrix user exists and mint a fresh session for it.
 
@@ -565,8 +573,15 @@ def sso_login_for_owner(username: str) -> dict:
     (matrix-js-sdk) requires to initialise a session; a session with an empty
     device_id is rejected and the client bounces to its own login screen.
 
+    Serialized under _sso_lock so concurrent logins can't race on the password.
+
     Returns {user_id, access_token, device_id, home_server}.
     """
+    with _sso_lock:
+        return _sso_login_for_owner_locked(username)
+
+
+def _sso_login_for_owner_locked(username: str) -> dict:
     admin_token = _get_admin_token()
     server = _server_name()
     user_id = f"@{username}:{server}"
