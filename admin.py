@@ -367,6 +367,17 @@ TEMPLATE = """<!DOCTYPE html>
             <span class="slider"></span>
           </label>
         </div>
+        <div style="margin-top:1rem">
+          <label for="community_room_alias" style="display:block;font-size:.85rem;color:#94a3b8;margin-bottom:.35rem">
+            Community room alias (optional)</label>
+          <input type="text" id="community_room_alias" name="community_room_alias"
+            value="{{ settings.community_room_alias or '' }}"
+            placeholder="#openhost-community:hub.example.com"
+            style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
+          <p style="font-size:.75rem;color:#64748b;margin-top:.35rem">
+            The room the onboarding "join the community" opt-in will join. Leave
+            blank to disable the community-join option.</p>
+        </div>
       </div>
 
       <button type="submit" class="save-btn">Save &amp; Apply</button>
@@ -595,6 +606,8 @@ def save():
     settings["federation_enabled"] = request.form.get("federation_enabled") == "1"
     settings["open_registration"] = request.form.get("open_registration") == "1"
     settings["community_enabled"] = request.form.get("community_enabled") == "1"
+    if "community_room_alias" in request.form:
+        settings["community_room_alias"] = request.form.get("community_room_alias", "").strip()
     save_settings(settings)
 
     yaml_error = None
