@@ -921,16 +921,25 @@ def _complete_pending_community_join() -> None:
         except SSOError:
             time.sleep(2)
 
-    try:
-        room_id = _join_community_room(username, room_alias)
-        settings = load_settings()
-        settings["community_joined"] = True
-        settings["community_join_pending"] = False
-        save_settings(settings)
-        app.logger.info("joined community room %s (%s)", room_alias, room_id)
-    except SSOError as exc:
-        # Leave the pending flag set so it retries on the next boot.
-        app.logger.error("pending community join failed (will retry next boot): %s", exc)
+    # Retry the join a handful of times within this boot: a remote (federated)
+    # alias may not resolve immediately after Synapse starts (federation/DNS
+    # warmup). If all attempts fail, leave the pending flag set so the next boot
+    # retries.
+    last_exc = None
+    for attempt in range(10):
+        try:
+            room_id = _join_community_room(username, room_alias)
+            settings = load_settings()
+            settings["community_joined"] = True
+            settings["community_join_pending"] = False
+            save_settings(settings)
+            app.logger.info("joined community room %s (%s)", room_alias, room_id)
+            return
+        except SSOError as exc:
+            last_exc = exc
+            app.logger.warning("community join attempt %d failed: %s", attempt + 1, exc)
+            time.sleep(6)
+    app.logger.error("pending community join failed after retries (will retry next boot): %s", last_exc)
 
 
 if __name__ == "__main__":
