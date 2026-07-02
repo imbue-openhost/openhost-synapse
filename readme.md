@@ -41,8 +41,9 @@ Implementation notes:
   `localhost:8008` (bypassing the router/zone-auth): it registers a one-time
   admin service account via Synapse's registration shared secret, ensures the
   owner's user exists, sets a fresh ephemeral password, and performs a normal
-  `m.login.password` to obtain a real `device_id` + access token. The service
-  account's credentials and token live in `openhost_sso.json` (mode 0600).
+  `m.login.password` to obtain a real `device_id` + access token. Only the
+  service account's access token (never a password) is persisted, in
+  `openhost_sso.json` (mode 0600).
 - The client is handed the session by a small bootstrap page that seeds Cinny's
   localStorage session keys and redirects into the app.
 - Community chat requires an app **restart** to take effect (the Caddy routing
