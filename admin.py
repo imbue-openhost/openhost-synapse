@@ -15,6 +15,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import signal
 import threading
 import urllib.error
@@ -434,7 +435,11 @@ def _shared_secret_register(username: str, password: str, admin: bool) -> dict:
     """Register a user via the shared-secret admin API (nonce + HMAC)."""
     nonce = _synapse_request("GET", "/_synapse/admin/v1/register")["nonce"]
     secret = _read_registration_shared_secret()
-    mac = hmac.new(secret.encode(), digestmod=hashlib.sha1)
+    # Synapse's shared-secret registration API mandates HMAC-SHA1 over
+    # nonce\0user\0password\0(admin|notadmin) — the algorithm is fixed by the
+    # protocol, not a security choice here. It is a keyed MAC for API auth, not a
+    # password hash. This is not user-controlled sensitive-data hashing.
+    mac = hmac.new(secret.encode(), digestmod=hashlib.sha1)  # noqa: S324  # codeql[py/weak-sensitive-data-hashing]
     mac.update(nonce.encode())
     mac.update(b"\x00")
     mac.update(username.encode())
@@ -470,31 +475,31 @@ def _save_sso_state(state: dict) -> None:
 
 
 def _generate_password() -> str:
-    import secrets
     return secrets.token_urlsafe(32)
 
 
-def _admin_login(password: str) -> str:
-    """Log the SSO service account in via password to obtain a fresh admin token."""
-    resp = _synapse_request(
-        "POST",
-        "/_matrix/client/v3/login",
-        body={
-            "type": "m.login.password",
-            "identifier": {"type": "m.id.user", "user": SSO_ADMIN_USER},
-            "password": password,
-        },
-    )
-    return resp["access_token"]
+def _bootstrap_admin_token() -> tuple[str, str]:
+    """Register a fresh admin service account via the shared secret and return
+    (access_token, user_id).
+
+    We register a *uniquely-named* account each time we need to bootstrap. This
+    avoids ever storing a password: the shared-secret register returns an access
+    token directly, so only the (non-reversible) token is persisted. Access tokens
+    don't expire by default, so this bootstrap runs essentially once; a unique name
+    means a re-bootstrap (e.g. lost state file) can't collide with M_USER_IN_USE.
+    """
+    unique = secrets.token_hex(6)
+    localpart = f"{SSO_ADMIN_USER}-{unique}"
+    result = _shared_secret_register(localpart, _generate_password(), admin=True)
+    return result["access_token"], result.get("user_id", "")
 
 
 def _get_admin_token() -> str:
-    """Return an admin access token, creating the SSO service account on first use.
+    """Return an admin access token, bootstrapping a service account on first use.
 
-    The account's password is persisted (0600) alongside the token so a stale
-    token can be refreshed by logging in again — we can't re-register an existing
-    user via the shared-secret endpoint (it 400s), so registration only happens
-    once, on very first use.
+    Only the resulting access token (not any password) is persisted, at 0600.
+    Synapse access tokens don't expire by default, so this is created once; if it
+    is ever missing/invalid we bootstrap a fresh, uniquely-named service account.
     """
     state = _load_sso_state()
     token = state.get("admin_token")
@@ -503,42 +508,10 @@ def _get_admin_token() -> str:
             _synapse_request("GET", "/_matrix/client/v3/account/whoami", token=token)
             return token
         except SSOError:
-            pass  # stale — refresh below
+            pass  # missing/invalid — bootstrap a fresh account below
 
-    # Refresh via stored password if we've registered before.
-    password = state.get("admin_password")
-    if password:
-        try:
-            token = _admin_login(password)
-            state["admin_token"] = token
-            _save_sso_state(state)
-            return token
-        except SSOError as exc:
-            app.logger.warning("admin re-login failed, will try re-register: %s", exc)
-
-    # First-time setup: register the service account and store its credentials.
-    # If the account already exists but our stored credentials are gone/wrong
-    # (e.g. openhost_sso.json was lost or corrupted), re-registration 400s. Surface
-    # a clear, actionable error rather than a raw Synapse 400.
-    password = _generate_password()
-    try:
-        result = _shared_secret_register(SSO_ADMIN_USER, password, admin=True)
-    except SSOError as exc:
-        if "M_USER_IN_USE" in str(exc) or "User ID already taken" in str(exc):
-            raise SSOError(
-                f"SSO admin account '{SSO_ADMIN_USER}' exists but its stored credentials "
-                f"({SSO_STATE_FILE.name}) are missing or invalid. Remove that account or "
-                "restore the credentials file to recover."
-            ) from exc
-        raise
-    token = result["access_token"]
-    _save_sso_state(
-        {
-            "admin_token": token,
-            "admin_user_id": result.get("user_id"),
-            "admin_password": password,
-        }
-    )
+    token, user_id = _bootstrap_admin_token()
+    _save_sso_state({"admin_token": token, "admin_user_id": user_id})
     return token
 
 
@@ -884,11 +857,12 @@ def community_onboarding():
                 apply_settings_to_yaml(settings)
             except OSError as exc:
                 app.logger.error("could not apply federation setting: %s", exc)
-                # Don't claim success if we couldn't patch homeserver.yaml.
+                # Don't claim success if we couldn't patch homeserver.yaml; keep the
+                # message generic so filesystem details aren't exposed to the client.
                 return render_template_string(
                     ONBOARDING_TEMPLATE,
                     error="Enabled chat, but could not turn on federation to join the "
-                    f"community: {exc}. You can retry from the admin console.",
+                    "community. You can retry from the admin console.",
                     suggested=username,
                     server_name=server,
                     community_room_alias=room_alias,
@@ -925,8 +899,10 @@ def community_login():
     try:
         session = sso_login_for_owner(username)
     except SSOError as exc:
+        # Log the detail server-side; return a generic message so internal
+        # errors (which may include upstream response bodies) aren't exposed.
         app.logger.error("community_login: SSO failed: %s", exc)
-        return f"Could not sign in to chat: {exc}", 502
+        return "Could not sign in to chat. Please try again or check the app logs.", 502
     # Cinny expects the homeserver base URL it will talk to (same origin).
     hs_base_url = f"https://{session['home_server']}"
     return render_template_string(
