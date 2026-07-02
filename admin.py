@@ -28,6 +28,8 @@ HOMESERVER_YAML = DATA_DIR / "homeserver.yaml"
 DEFAULTS = {
     "federation_enabled": False,
     "open_registration": True,
+    "community_enabled": False,
+    "community_onboarded": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -335,6 +337,21 @@ TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
+      <div class="card">
+        <div class="setting-row">
+          <div class="setting-info">
+            <h2>Community Chat</h2>
+            <p>Serve the built-in web chat client at this app's URL and enable the
+               OpenHost community first-run flow. Requires an app restart to apply.</p>
+          </div>
+          <label class="toggle-label">
+            <input type="checkbox" name="community_enabled" value="1"
+              {% if settings.community_enabled %}checked{% endif %}>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
       <button type="submit" class="save-btn">Save &amp; Apply</button>
     </form>
   </div>
@@ -355,10 +372,12 @@ def index():
 
 @app.route("/_openhost/admin/save", methods=["POST"])
 def save():
-    settings = {
-        "federation_enabled": request.form.get("federation_enabled") == "1",
-        "open_registration": request.form.get("open_registration") == "1",
-    }
+    # Merge onto existing settings so flags not shown on this form (e.g.
+    # community_onboarded, set by the onboarding flow) are preserved.
+    settings = load_settings()
+    settings["federation_enabled"] = request.form.get("federation_enabled") == "1"
+    settings["open_registration"] = request.form.get("open_registration") == "1"
+    settings["community_enabled"] = request.form.get("community_enabled") == "1"
     save_settings(settings)
 
     yaml_error = None

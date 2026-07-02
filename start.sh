@@ -26,7 +26,9 @@ if [ ! -f "$SETTINGS_FILE" ]; then
     cat > "$SETTINGS_FILE" <<'EOF'
 {
   "federation_enabled": false,
-  "open_registration": true
+  "open_registration": true,
+  "community_enabled": false,
+  "community_onboarded": false
 }
 EOF
     echo "Created default settings: $SETTINGS_FILE"
@@ -54,7 +56,18 @@ except Exception as e:
     print('true')
 ")
 
-echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION"
+COMMUNITY_ENABLED=$(python3 -c "
+import json, sys
+try:
+    with open('$SETTINGS_FILE') as f:
+        d = json.load(f)
+    print('true' if d.get('community_enabled', False) else 'false')
+except Exception as e:
+    sys.stderr.write('Warning: could not read settings file: ' + str(e) + '\n')
+    print('false')
+")
+
+echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION community_enabled=$COMMUNITY_ENABLED"
 
 # Synapse's start.py hardcodes a few paths under /data (secret key files,
 # appservices glob).  If persistent storage is elsewhere, symlink individual
@@ -291,10 +304,50 @@ if grep -q "^database:" "$DATA_DIR/homeserver.yaml"; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# Web client (Cinny) — served at the app root only when community chat is
+# enabled. When disabled (default), the root handler proxies to Synapse so a
+# bare homeserver deployment behaves exactly as before.
+# ---------------------------------------------------------------------------
+WEBROOT="/app/webclient"
+if [ "$COMMUNITY_ENABLED" = "true" ] && [ -d "$WEBROOT" ]; then
+    echo "Community chat enabled — serving bundled web client from $WEBROOT"
+    # Render Cinny's config.json with this zone's homeserver pinned. Community
+    # room/space wiring is filled in later once federation + room alias exist;
+    # for now feature nothing (empty lists) so the client points only locally.
+    if [ -f /app/webclient-config.template.json ]; then
+        sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
+            -e "s|COMMUNITY_SPACE_PLACEHOLDER||g" \
+            -e "s|COMMUNITY_ROOM_PLACEHOLDER||g" \
+            -e "s|COMMUNITY_SERVER_PLACEHOLDER||g" \
+            /app/webclient-config.template.json > "$WEBROOT/config.json"
+        echo "Rendered web client config.json (homeserver=$SERVER_NAME)"
+    fi
+    # file_server for the SPA; unmatched paths fall back to index.html so
+    # Cinny's client-side router works on deep links / refresh.
+    ROOT_HANDLER="root * ${WEBROOT}
+		try_files {path} /index.html
+		file_server"
+else
+    echo "Community chat disabled — root proxies to Synapse (bare homeserver)"
+    ROOT_HANDLER="reverse_proxy localhost:8008 {
+			header_up Host {header.X-Forwarded-Host}
+		}"
+fi
+
 # Generate Caddyfile from template with .well-known client discovery.
-sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
-    -e "s|PUBLIC_BASEURL_PLACEHOLDER|${PUBLIC_BASEURL}|g" \
-    /app/Caddyfile.template > /app/Caddyfile
+# Use a Python replacement for the root handler because it may span multiple
+# lines (sed with newlines is fragile).
+export ROOT_HANDLER
+python3 - "$SERVER_NAME" "$PUBLIC_BASEURL" <<'PYEOF'
+import os, sys
+server_name, public_baseurl = sys.argv[1], sys.argv[2]
+tpl = open("/app/Caddyfile.template").read()
+tpl = tpl.replace("SERVER_NAME_PLACEHOLDER", server_name)
+tpl = tpl.replace("PUBLIC_BASEURL_PLACEHOLDER", public_baseurl)
+tpl = tpl.replace("ROOT_HANDLER_PLACEHOLDER", os.environ["ROOT_HANDLER"])
+open("/app/Caddyfile", "w").write(tpl)
+PYEOF
 echo "well-known: client_base=${PUBLIC_BASEURL}"
 
 # Fix ownership for the host user (UID 1000)
