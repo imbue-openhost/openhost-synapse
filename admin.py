@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from flask import Flask, render_template_string, request
+from flask import Flask, redirect, render_template_string, request
 
 app = Flask(__name__)
 
@@ -606,14 +606,126 @@ window.location.replace("/");
 """
 
 
+ONBOARDING_TEMPLATE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Set up Community Chat</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
+  .container{max-width:620px;margin:0 auto}
+  h1{font-size:1.6rem;color:#f8fafc;margin-bottom:.25rem}
+  .subtitle{color:#94a3b8;margin-bottom:1.5rem}
+  .card{background:#1e2130;border:1px solid #2d3348;border-radius:.75rem;padding:1.5rem;margin-bottom:1rem}
+  .card h2{font-size:1.05rem;color:#f1f5f9;margin:0 0 .5rem}
+  .card p,li{color:#cbd5e1;font-size:.9rem;line-height:1.5}
+  ul{margin:.5rem 0 0 1.1rem}
+  label{display:block;font-size:.9rem;color:#f1f5f9;margin-bottom:.35rem}
+  input[type=text]{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem}
+  .hint{color:#64748b;font-size:.8rem;margin-top:.35rem}
+  .consent{display:flex;gap:.6rem;align-items:flex-start;margin-top:1rem}
+  .consent input{margin-top:.2rem}
+  .btn{display:block;width:100%;padding:.75rem;background:#6366f1;color:#fff;border:none;border-radius:.5rem;font-size:.95rem;font-weight:500;cursor:pointer;margin-top:1.25rem}
+  .btn:hover{background:#4f46e5}
+  .warn{background:#1c1003;border:1px solid #92400e;color:#fbbf24;border-radius:.5rem;padding:.75rem 1rem;font-size:.85rem;margin-bottom:1rem}
+  .err{color:#f87171;font-size:.85rem;margin-top:.5rem}
+</style></head>
+<body><div class="container">
+  <h1>Welcome to Community Chat</h1>
+  <p class="subtitle">A Matrix-based chat client, built in to your OpenHost instance.</p>
+
+  <div class="card">
+    <h2>What this does</h2>
+    <p>This runs a private Matrix homeserver on your instance and gives you a web
+       chat client, signed in automatically as the instance owner. You can chat
+       privately, invite others, and — if you opt in — join the wider OpenHost
+       community room.</p>
+  </div>
+
+  <div class="card">
+    <h2>Before you continue</h2>
+    <ul>
+      <li><strong>Federation is optional and off by default.</strong> Your server
+          only talks to other Matrix servers (including the OpenHost community) if
+          you enable federation later in the admin console.</li>
+      <li><strong>Running a federated server may carry responsibilities</strong>
+          (content, data, and legal considerations) that vary by jurisdiction.
+          Review these before enabling federation.</li>
+      <li><strong>Federation needs a publicly reachable instance.</strong> It will
+          not work on setups without public inbound HTTPS (e.g. some tunnel-only
+          configurations).</li>
+    </ul>
+  </div>
+
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+
+  <form method="POST" action="/_openhost/community/onboarding">
+    <div class="card">
+      <label for="username">Choose your chat username</label>
+      <input type="text" id="username" name="username" value="{{ suggested }}"
+             pattern="[a-z0-9._=/-]+" required autocomplete="off">
+      <p class="hint">Lowercase letters, numbers, and . _ = / - only. Your Matrix
+         address will be <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
+      <label class="consent">
+        <input type="checkbox" name="consent" value="1" required>
+        <span>I understand what community chat does and the considerations above,
+              and I want to enable it.</span>
+      </label>
+    </div>
+    <button type="submit" class="btn">Enable community chat</button>
+  </form>
+</div></body></html>
+"""
+
+_USERNAME_RE = re.compile(r"^[a-z0-9._=/-]+$")
+
+
+@app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
+def community_onboarding():
+    """First-run consent + username flow. Owner-only (zone_auth gated)."""
+    if not load_settings().get("community_enabled", False):
+        return "Community chat is not enabled.", 404
+    server = ""
+    try:
+        server = _server_name()
+    except SSOError:
+        pass
+
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip().lower()
+        consent = request.form.get("consent") == "1"
+        error = None
+        if not consent:
+            error = "Please confirm you understand before enabling."
+        elif not username or not _USERNAME_RE.match(username) or username.startswith("_"):
+            error = "Invalid username. Use lowercase letters, numbers, and . _ = / - (not starting with _)."
+        if error:
+            return render_template_string(
+                ONBOARDING_TEMPLATE, error=error, suggested=username, server_name=server
+            )
+        settings = load_settings()
+        settings["community_username"] = username
+        settings["community_onboarded"] = True
+        save_settings(settings)
+        return redirect("/_openhost/community/login", code=302)
+
+    return render_template_string(
+        ONBOARDING_TEMPLATE, error=None, suggested="owner", server_name=server
+    )
+
+
 @app.route("/_openhost/community/login")
 def community_login():
     """Owner SSO entrypoint: mint a Matrix session and hand it to the web client.
 
     Only reachable by the OpenHost owner (zone_auth gates this subdomain path).
+    Redirects to onboarding on first run until consent is recorded.
     """
-    if not load_settings().get("community_enabled", False):
+    settings = load_settings()
+    if not settings.get("community_enabled", False):
         return "Community chat is not enabled.", 404
+    if not settings.get("community_onboarded", False):
+        return redirect("/_openhost/community/onboarding", code=302)
     username = _owner_matrix_username()
     try:
         session = sso_login_for_owner(username)

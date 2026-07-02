@@ -323,6 +323,23 @@ if [ "$COMMUNITY_ENABLED" = "true" ] && [ -d "$WEBROOT" ]; then
             /app/webclient-config.template.json > "$WEBROOT/config.json"
         echo "Rendered web client config.json (homeserver=$SERVER_NAME)"
     fi
+    # Inject a first-run guard into index.html: if the client has no session yet,
+    # bounce to the OpenHost SSO/onboarding endpoint. Idempotent (only injects
+    # once). This is what makes the owner hit onboarding on first open without
+    # having to serve Cinny from a subpath.
+    if [ -f "$WEBROOT/index.html" ] && ! grep -q "openhost-firstrun-guard" "$WEBROOT/index.html"; then
+        GUARD='<script id="openhost-firstrun-guard">if(!localStorage.getItem("cinny_access_token")&&location.pathname==="/"){location.replace("/_openhost/community/login");}</script>'
+        # Insert right after <head> so it runs before Cinny boots.
+        python3 - "$WEBROOT/index.html" "$GUARD" <<'PYEOF'
+import sys
+path, guard = sys.argv[1], sys.argv[2]
+html = open(path).read()
+if "openhost-firstrun-guard" not in html:
+    html = html.replace("<head>", "<head>" + guard, 1)
+    open(path, "w").write(html)
+PYEOF
+        echo "Injected first-run guard into web client index.html"
+    fi
     # file_server for the SPA; unmatched paths fall back to index.html so
     # Cinny's client-side router works on deep links / refresh.
     ROOT_HANDLER="root * ${WEBROOT}
