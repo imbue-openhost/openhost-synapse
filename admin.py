@@ -34,7 +34,9 @@ HOMESERVER_YAML = DATA_DIR / "homeserver.yaml"
 SYNAPSE_BASE = os.environ.get("SYNAPSE_LOCAL_URL", "http://localhost:8008")
 # Where we persist the SSO service account's admin access token.
 SSO_STATE_FILE = DATA_DIR / "openhost_sso.json"
-SSO_ADMIN_USER = "_openhost_sso_admin"
+# Synapse reserves the leading "_" localpart for appservices, so it can't start
+# with an underscore. Keep it distinctive to avoid clashing with real users.
+SSO_ADMIN_USER = "openhost-sso-admin"
 
 DEFAULTS = {
     "federation_enabled": False,
