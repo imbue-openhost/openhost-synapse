@@ -491,7 +491,13 @@ def _read_server_name_from_yaml() -> str:
 
 
 def sso_login_for_owner(username: str) -> dict:
-    """Ensure the owner's Matrix user exists and mint a fresh access token for it.
+    """Ensure the owner's Matrix user exists and mint a fresh session for it.
+
+    We set the owner's password via the admin API, then perform a *normal*
+    client login (m.login.password). Unlike the admin login endpoint, this
+    creates a real device and returns a device_id — which the web client
+    (matrix-js-sdk) requires to initialise a session; a session with an empty
+    device_id is rejected and the client bounces to its own login screen.
 
     Returns {user_id, access_token, device_id, home_server}.
     """
@@ -499,27 +505,31 @@ def sso_login_for_owner(username: str) -> dict:
     server = _server_name()
     user_id = f"@{username}:{server}"
 
-    # Idempotently ensure the user exists (admin PUT is create-or-update).
+    # Set a fresh, ephemeral password for this login. Idempotent create-or-update.
+    password = _generate_password()
     _synapse_request(
         "PUT",
         f"/_synapse/admin/v2/users/{user_id}",
         token=admin_token,
-        body={"password": _generate_password()},
+        # logout_devices=False so re-running SSO doesn't kill the owner's other
+        # existing chat sessions (e.g. a mobile client) via the password change.
+        body={"password": password, "logout_devices": False},
     )
-    # Mint a login token/session for the user via the admin login API.
+    # Normal client login -> real device_id + access_token.
     login = _synapse_request(
         "POST",
-        f"/_synapse/admin/v1/users/{user_id}/login",
-        token=admin_token,
-        body={},
+        "/_matrix/client/v3/login",
+        body={
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": username},
+            "password": password,
+            "initial_device_display_name": "OpenHost Community (SSO)",
+        },
     )
-    access_token = login["access_token"]
-    # Resolve device_id via whoami with the new token.
-    whoami = _synapse_request("GET", "/_matrix/client/v3/account/whoami", token=access_token)
     return {
-        "user_id": user_id,
-        "access_token": access_token,
-        "device_id": whoami.get("device_id", ""),
+        "user_id": login.get("user_id", user_id),
+        "access_token": login["access_token"],
+        "device_id": login.get("device_id", ""),
         "home_server": server,
     }
 
