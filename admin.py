@@ -458,20 +458,59 @@ def _generate_password() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _admin_login(password: str) -> str:
+    """Log the SSO service account in via password to obtain a fresh admin token."""
+    resp = _synapse_request(
+        "POST",
+        "/_matrix/client/v3/login",
+        body={
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": SSO_ADMIN_USER},
+            "password": password,
+        },
+    )
+    return resp["access_token"]
+
+
 def _get_admin_token() -> str:
-    """Return an admin access token, creating the SSO service account on first use."""
+    """Return an admin access token, creating the SSO service account on first use.
+
+    The account's password is persisted (0600) alongside the token so a stale
+    token can be refreshed by logging in again — we can't re-register an existing
+    user via the shared-secret endpoint (it 400s), so registration only happens
+    once, on very first use.
+    """
     state = _load_sso_state()
     token = state.get("admin_token")
     if token:
-        # Verify it still works; whoami requires a valid token.
         try:
             _synapse_request("GET", "/_matrix/client/v3/account/whoami", token=token)
             return token
         except SSOError:
-            pass  # stale — re-register below
-    result = _shared_secret_register(SSO_ADMIN_USER, _generate_password(), admin=True)
+            pass  # stale — refresh below
+
+    # Refresh via stored password if we've registered before.
+    password = state.get("admin_password")
+    if password:
+        try:
+            token = _admin_login(password)
+            state["admin_token"] = token
+            _save_sso_state(state)
+            return token
+        except SSOError as exc:
+            app.logger.warning("admin re-login failed, will try re-register: %s", exc)
+
+    # First-time setup: register the service account and store its credentials.
+    password = _generate_password()
+    result = _shared_secret_register(SSO_ADMIN_USER, password, admin=True)
     token = result["access_token"]
-    _save_sso_state({"admin_token": token, "admin_user_id": result.get("user_id")})
+    _save_sso_state(
+        {
+            "admin_token": token,
+            "admin_user_id": result.get("user_id"),
+            "admin_password": password,
+        }
+    )
     return token
 
 
@@ -683,8 +722,14 @@ _USERNAME_RE = re.compile(r"^[a-z0-9._=/-]+$")
 @app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
 def community_onboarding():
     """First-run consent + username flow. Owner-only (zone_auth gated)."""
-    if not load_settings().get("community_enabled", False):
+    settings = load_settings()
+    if not settings.get("community_enabled", False):
         return "Community chat is not enabled.", 404
+    # Onboarding is one-time: once done, the Matrix account exists under the
+    # chosen username, so re-running this must not silently re-point it. Send
+    # already-onboarded owners straight to login instead.
+    if settings.get("community_onboarded", False):
+        return redirect("/_openhost/community/login", code=302)
     server = ""
     try:
         server = _server_name()

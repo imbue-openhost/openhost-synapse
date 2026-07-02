@@ -6,6 +6,47 @@ Matrix Synapse homeserver for OpenHost. Runs as a single Docker container:
 - SQLite database (no external database required)
 - Persistent data in OpenHost's app_data directory
 - Admin UI at `/_openhost/admin` for managing federation and registration
+- Optional built-in **community chat**: a bundled web client (Cinny) with
+  owner single-sign-on and a first-run onboarding flow (off by default)
+
+## Community chat (optional)
+
+By default this app is a headless homeserver with no web client. Enabling
+**Community Chat** in the admin UI (then restarting the app) turns it into a
+ready-to-use chat client:
+
+- The bundled [Cinny](https://cinny.in) web client is served at the app's URL,
+  pinned to this homeserver (custom homeservers disabled).
+- The OpenHost **owner is auto-logged-in** via SSO: opening the app with no
+  existing session runs a first-run **onboarding/consent** flow (explains the
+  feature and the federation/legal/public-reachability considerations, and lets
+  you pick a Matrix username), then signs you straight into the client.
+- The web client and onboarding are gated by OpenHost zone auth, so only the
+  owner can reach them. The Matrix APIs (`/_matrix`, `.well-known`) stay public
+  as usual.
+
+Relevant settings in `openhost_settings.json`:
+
+```json
+{
+  "community_enabled": false,
+  "community_onboarded": false,
+  "community_username": "owner"
+}
+```
+
+Implementation notes:
+
+- SSO mints a Matrix session for the owner by talking to Synapse over
+  `localhost:8008` (bypassing the router/zone-auth): it registers a one-time
+  admin service account via Synapse's registration shared secret, ensures the
+  owner's user exists, sets a fresh ephemeral password, and performs a normal
+  `m.login.password` to obtain a real `device_id` + access token. The service
+  account's credentials and token live in `openhost_sso.json` (mode 0600).
+- The client is handed the session by a small bootstrap page that seeds Cinny's
+  localStorage session keys and redirects into the app.
+- Community chat requires an app **restart** to take effect (the Caddy routing
+  and web client config are rendered by `start.sh` on boot).
 
 ## How it works
 
@@ -24,10 +65,12 @@ On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` 
 
 Settings for federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
 
-The UI has two toggles:
+The UI has three toggles:
 
 - **Open Registration** — allow anyone to create an account without an invitation
 - **Federation** — allow this server to communicate with other Matrix homeservers
+- **Community Chat** — serve the bundled web client + owner SSO/onboarding (see
+  "Community chat" above); requires an app restart to apply
 
 On save, the admin UI updates `openhost_settings.json` and patches `homeserver.yaml`. A restart of the app is required for the changes to take effect (Synapse's SIGHUP only reloads log config, not registration or federation settings).
 
