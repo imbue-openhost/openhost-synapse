@@ -40,15 +40,22 @@ SSO_STATE_FILE = DATA_DIR / "openhost_sso.json"
 # with an underscore. Keep it distinctive to avoid clashing with real users.
 SSO_ADMIN_USER = "openhost-sso-admin"
 
+# The canonical OpenHost community room. This is the room the "join the
+# community" flow joins over federation. It lives on the OpenHost community hub
+# homeserver (a plain federating Synapse) and is deliberately referenced only by
+# this alias string — the hub itself is separate infrastructure. Overridable per
+# instance via the admin console or the OPENHOST_COMMUNITY_ROOM_ALIAS env var.
+DEFAULT_COMMUNITY_ROOM_ALIAS = "#openhost-community-general:matrix.openhost.imbue.com"
+
 DEFAULTS = {
     "federation_enabled": False,
     "open_registration": True,
     "community_enabled": False,
     "community_onboarded": False,
     "community_joined": False,
-    # The single string defining which room the "join the community" flow joins,
-    # e.g. "#openhost-community:hub.example.com". Empty = no community configured.
-    "community_room_alias": "",
+    # The single string defining which room the "join the community" flow joins.
+    # Defaults to the canonical OpenHost community room; can be overridden.
+    "community_room_alias": DEFAULT_COMMUNITY_ROOM_ALIAS,
 }
 
 # ---------------------------------------------------------------------------
@@ -374,7 +381,7 @@ TEMPLATE = """<!DOCTYPE html>
             Community room alias (optional)</label>
           <input type="text" id="community_room_alias" name="community_room_alias"
             value="{{ settings.community_room_alias or '' }}"
-            placeholder="#openhost-community:hub.example.com"
+            placeholder="#openhost-community-general:matrix.openhost.imbue.com"
             style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
           <p style="font-size:.75rem;color:#64748b;margin-top:.35rem">
             The room the onboarding "join the community" opt-in will join. Leave

@@ -22,15 +22,21 @@ mkdir -p "$DATA_DIR"
 # openhost_settings.json — source of truth for admin-controlled toggles.
 # Written once on first boot; thereafter managed by the admin UI.
 # ---------------------------------------------------------------------------
+# The canonical OpenHost community room, hardcoded as the default target for the
+# "join the community" flow. Lives on the OpenHost community hub homeserver and
+# is joined over federation. Overridable per instance via
+# OPENHOST_COMMUNITY_ROOM_ALIAS or the admin console.
+DEFAULT_COMMUNITY_ROOM_ALIAS="#openhost-community-general:matrix.openhost.imbue.com"
+
 if [ ! -f "$SETTINGS_FILE" ]; then
-    cat > "$SETTINGS_FILE" <<'EOF'
+    cat > "$SETTINGS_FILE" <<EOF
 {
   "federation_enabled": false,
   "open_registration": true,
   "community_enabled": false,
   "community_onboarded": false,
   "community_joined": false,
-  "community_room_alias": ""
+  "community_room_alias": "$DEFAULT_COMMUNITY_ROOM_ALIAS"
 }
 EOF
     echo "Created default settings: $SETTINGS_FILE"
@@ -69,24 +75,28 @@ except Exception as e:
     print('false')
 ")
 
-# Seed the community room alias from an env var on first boot if unset. This is
-# the single string that defines which room the "join the community" flow joins,
-# e.g. "#openhost-community:hub.example.com". Kept in settings so it can also be
-# managed later without redeploying.
-if [ -n "$OPENHOST_COMMUNITY_ROOM_ALIAS" ]; then
-    python3 - "$SETTINGS_FILE" "$OPENHOST_COMMUNITY_ROOM_ALIAS" <<'PYEOF'
+# The community room alias defaults to the canonical OpenHost room (baked into
+# the settings above). An operator can override it per instance by setting
+# OPENHOST_COMMUNITY_ROOM_ALIAS; if set, it wins over the default but never
+# clobbers a value already chosen in the admin console. The default is applied
+# on first boot, so this only needs to handle the env-override case and any
+# older settings files that predate the hardcoded default (empty alias).
+ALIAS_OVERRIDE="${OPENHOST_COMMUNITY_ROOM_ALIAS:-$DEFAULT_COMMUNITY_ROOM_ALIAS}"
+python3 - "$SETTINGS_FILE" "$ALIAS_OVERRIDE" "${OPENHOST_COMMUNITY_ROOM_ALIAS:-}" <<'PYEOF'
 import json, sys
-path, alias = sys.argv[1], sys.argv[2]
+path, alias, env_override = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     d = json.load(open(path))
 except Exception:
     d = {}
-if not d.get("community_room_alias"):
+current = d.get("community_room_alias", "")
+# Apply when: no alias set yet (old/empty settings), OR an explicit env override
+# is provided that differs from the current value.
+if not current or (env_override and current != env_override):
     d["community_room_alias"] = alias
     json.dump(d, open(path, "w"), indent=2)
-    print(f"Seeded community_room_alias={alias}")
+    print(f"Set community_room_alias={alias}")
 PYEOF
-fi
 
 echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION community_enabled=$COMMUNITY_ENABLED"
 
