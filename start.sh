@@ -75,27 +75,31 @@ except Exception as e:
     print('false')
 ")
 
-# The community room alias defaults to the canonical OpenHost room (baked into
-# the settings above). An operator can override it per instance by setting
-# OPENHOST_COMMUNITY_ROOM_ALIAS; if set, it wins over the default but never
-# clobbers a value already chosen in the admin console. The default is applied
-# on first boot, so this only needs to handle the env-override case and any
-# older settings files that predate the hardcoded default (empty alias).
-ALIAS_OVERRIDE="${OPENHOST_COMMUNITY_ROOM_ALIAS:-$DEFAULT_COMMUNITY_ROOM_ALIAS}"
-python3 - "$SETTINGS_FILE" "$ALIAS_OVERRIDE" "${OPENHOST_COMMUNITY_ROOM_ALIAS:-}" <<'PYEOF'
+# Backfill the community room alias ONLY when the settings file predates the
+# hardcoded default and has no alias key at all (older instances created before
+# this default existed). We must NOT touch a key that is present-but-empty: the
+# admin console lets an operator deliberately blank the alias to disable the
+# community-join opt-in ("Leave blank to disable"), and re-populating it would
+# silently re-enable a feature they turned off. We also must NOT overwrite a
+# value already present, so an admin-chosen alias is never clobbered on reboot.
+#
+# OPENHOST_COMMUNITY_ROOM_ALIAS, if set, seeds the alias only when the key is
+# absent (a provisioning-time default), for the same reason — it is not a
+# per-reboot enforcer that would override later admin choices.
+ALIAS_SEED="${OPENHOST_COMMUNITY_ROOM_ALIAS:-$DEFAULT_COMMUNITY_ROOM_ALIAS}"
+python3 - "$SETTINGS_FILE" "$ALIAS_SEED" <<'PYEOF'
 import json, sys
-path, alias, env_override = sys.argv[1], sys.argv[2], sys.argv[3]
+path, seed = sys.argv[1], sys.argv[2]
 try:
     d = json.load(open(path))
 except Exception:
     d = {}
-current = d.get("community_room_alias", "")
-# Apply when: no alias set yet (old/empty settings), OR an explicit env override
-# is provided that differs from the current value.
-if not current or (env_override and current != env_override):
-    d["community_room_alias"] = alias
+# Only seed when the key is entirely absent. A present value (including an
+# intentionally-empty string) is authoritative and left untouched.
+if "community_room_alias" not in d:
+    d["community_room_alias"] = seed
     json.dump(d, open(path, "w"), indent=2)
-    print(f"Set community_room_alias={alias}")
+    print(f"Seeded community_room_alias={seed}")
 PYEOF
 
 echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION community_enabled=$COMMUNITY_ENABLED"
