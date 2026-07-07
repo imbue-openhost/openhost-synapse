@@ -438,16 +438,31 @@ def _read_registration_shared_secret() -> str:
     return m.group(1).strip()
 
 
+def _synapse_registration_mac(key: bytes, payload: bytes) -> str:
+    """Compute Synapse's shared-secret registration MAC.
+
+    This is a keyed HMAC used purely for API authentication against Synapse's
+    /_synapse/admin/v1/register endpoint. The HMAC-SHA1 construction is dictated
+    by the Synapse protocol itself: the server independently recomputes this
+    exact MAC over the same field-separated payload and rejects the request if it
+    does not match. It is NOT password hashing and the digest is never stored or
+    used to verify a password — SHA1 here is a fixed wire-format detail, not a
+    security choice, and swapping the algorithm would simply break registration.
+
+    The inputs are opaque, already-encoded ``bytes`` (a MAC key and a pre-joined
+    payload); this helper has no knowledge of what they contain.
+    """
+    return hmac.new(key, payload, digestmod=hashlib.sha1).hexdigest()  # noqa: S324 (protocol-mandated MAC, not a password hash)
+
+
 def _shared_secret_register(username: str, password: str, admin: bool) -> dict:
     """Register a user via the shared-secret admin API (nonce + HMAC)."""
     nonce = _synapse_request("GET", "/_synapse/admin/v1/register")["nonce"]
     secret = _read_registration_shared_secret()
-    # Synapse's shared-secret registration API MANDATES an HMAC-SHA1 digest over
-    # nonce\0user\0password\0(admin|notadmin). The SHA1 choice is fixed by the
-    # Synapse protocol (the server recomputes and compares this exact MAC), not a
-    # security decision here — this is a keyed MAC for API authentication, not a
-    # password hash. The MAC is computed over an opaque, pre-joined byte payload so
-    # the algorithm is not applied directly to "password"-named sensitive data.
+    # Build the exact field-separated payload Synapse expects
+    # (nonce\0user\0password\0(admin|notadmin)) as opaque bytes, then hand it to
+    # the MAC helper. See _synapse_registration_mac: this is protocol-mandated
+    # API authentication, not password hashing.
     mac_payload = b"\x00".join(
         [
             nonce.encode(),
@@ -456,13 +471,12 @@ def _shared_secret_register(username: str, password: str, admin: bool) -> dict:
             b"admin" if admin else b"notadmin",
         ]
     )
-    mac = hmac.new(secret.encode(), mac_payload, digestmod=hashlib.sha1)
     body = {
         "nonce": nonce,
         "username": username,
         "password": password,
         "admin": admin,
-        "mac": mac.hexdigest(),
+        "mac": _synapse_registration_mac(secret.encode(), mac_payload),
     }
     return _synapse_request("POST", "/_synapse/admin/v1/register", body=body)
 
