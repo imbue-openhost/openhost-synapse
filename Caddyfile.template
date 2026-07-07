@@ -41,10 +41,11 @@
 		}
 	}
 
-	# Root handler. When the community web client is disabled (default), this
-	# proxies everything else to Synapse so a bare homeserver behaves exactly as
-	# before. When enabled, start.sh replaces this with a file_server that serves
-	# the bundled Cinny SPA (falling back to index.html for client-side routing).
+	# Root handler. start.sh renders this to a file_server that serves the
+	# bundled Cinny SPA (falling back to index.html for client-side routing),
+	# so the web client is always available at the app root. Only if the client
+	# somehow isn't bundled in the image does start.sh fall back to proxying the
+	# root to Synapse (bare homeserver).
 	handle {
 		ROOT_HANDLER_PLACEHOLDER
 	}
