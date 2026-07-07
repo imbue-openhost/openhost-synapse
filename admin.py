@@ -53,21 +53,35 @@ SSO_STATE_FILE = DATA_DIR / "openhost_sso.json"
 # with an underscore. Keep it distinctive to avoid clashing with real users.
 SSO_ADMIN_USER = "openhost-sso-admin"
 
-# The canonical OpenHost community room. This is the room the "join the
-# community" flow joins over federation. It lives on the OpenHost community hub
-# homeserver (a plain federating Synapse) and is deliberately referenced only by
-# this alias string — the hub itself is separate infrastructure. Overridable per
-# instance via the admin console or the OPENHOST_COMMUNITY_ROOM_ALIAS env var.
-DEFAULT_COMMUNITY_ROOM_ALIAS = "#openhost-community-general:matrix.openhost.imbue.com"
+# The canonical OpenHost community *space*. This is the space the "join the
+# community" flow joins over federation. A Matrix space is itself a room whose
+# child rooms are declared via m.space.child state; joining it gives the client
+# the space and lets the user browse/enter its rooms. It lives on the OpenHost
+# community hub homeserver and is referenced only by this alias string — the hub
+# is separate infrastructure. Overridable per instance via the admin console or
+# the OPENHOST_COMMUNITY_ROOM_ALIAS env var.
+DEFAULT_COMMUNITY_ROOM_ALIAS = "#openhost-community:matrix.openhost.imbue.com"
+
+# Default rooms created inside the instance's own local space on first setup, so
+# a fresh instance has ready-to-use rooms instead of an empty client. (localpart
+# alias suffix, display name, topic)
+DEFAULT_LOCAL_SPACE_NAME = "Community"
+DEFAULT_LOCAL_ROOMS = [
+    ("general", "General", "General chat"),
+    ("random", "Random", "Off-topic and random chatter"),
+    ("help", "Help", "Questions and support"),
+]
 
 DEFAULTS = {
     "federation_enabled": False,
     "open_registration": True,
     "community_onboarded": False,
     "community_joined": False,
-    # The single string defining which room the "join the community" flow joins.
-    # Defaults to the canonical OpenHost community room; can be overridden.
+    # The alias of the space the "join the community" flow joins. Defaults to the
+    # canonical OpenHost community space; can be overridden.
     "community_room_alias": DEFAULT_COMMUNITY_ROOM_ALIAS,
+    # Set once we've created the instance's own local space + default rooms.
+    "local_space_created": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -465,14 +479,14 @@ TEMPLATE = """<!DOCTYPE html>
         </div>
         <div style="margin-top:1rem">
           <label for="community_room_alias" style="display:block;font-size:.85rem;color:#94a3b8;margin-bottom:.35rem">
-            Community room alias (optional)</label>
+            Community space alias (optional)</label>
           <input type="text" id="community_room_alias" name="community_room_alias"
             value="{{ settings.community_room_alias or '' }}"
-            placeholder="#openhost-community-general:matrix.openhost.imbue.com"
+            placeholder="#openhost-community:matrix.openhost.imbue.com"
             style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
           <p style="font-size:.75rem;color:#64748b;margin-top:.35rem">
-            The room the onboarding "join the community" opt-in will join. Leave
-            blank to disable the community-join option.</p>
+            The space (or room) the onboarding "join the community" opt-in will
+            join. Leave blank to disable the community-join option.</p>
         </div>
       </div>
 
@@ -878,8 +892,10 @@ def save():
 
 
 def _join_community_room(username: str, room_alias: str) -> str:
-    """Join the owner's account to a (federated) room by alias. Returns room_id.
+    """Join the owner's account to a (federated) room/space by alias.
 
+    Returns the room_id. Works for a space alias too (a space is just a room);
+    joining a space gives the client the space so the user can browse its rooms.
     Federation must already be enabled and active for a remote alias to resolve.
     """
     session = sso_login_for_owner(username)
@@ -889,6 +905,81 @@ def _join_community_room(username: str, room_alias: str) -> str:
     quoted = urllib.parse.quote(room_alias, safe="")
     resp = _synapse_request("POST", f"/_matrix/client/v3/join/{quoted}", token=token, body={})
     return resp.get("room_id", "")
+
+
+def _create_local_space_with_rooms(username: str) -> None:
+    """Create a local space with a few default rooms on THIS homeserver, owned by
+    the onboarding user, so a fresh instance has ready-to-use rooms.
+
+    Idempotent-ish: guarded by the local_space_created setting so it runs once.
+    A space is a room created with creation_content type m.space; child rooms are
+    linked via m.space.child state on the space (and m.space.parent on the room
+    so clients show the hierarchy). All local, so no federation is required.
+    """
+    session = sso_login_for_owner(username)
+    token = session["access_token"]
+    server = session["home_server"]
+
+    def _create_room(body: dict) -> str:
+        resp = _synapse_request(
+            "POST", "/_matrix/client/v3/createRoom", token=token, body=body
+        )
+        return resp["room_id"]
+
+    # 1. Create the space (a room of type m.space).
+    space_id = _create_room(
+        {
+            "name": DEFAULT_LOCAL_SPACE_NAME,
+            "topic": "Rooms on this server",
+            "preset": "private_chat",
+            "creation_content": {"type": "m.space"},
+            "power_level_content_override": {"events_default": 0},
+        }
+    )
+
+    # 2. Create each default room and link it to the space.
+    via = [server]
+    for suffix, name, topic in DEFAULT_LOCAL_ROOMS:
+        room_id = _create_room(
+            {
+                "name": name,
+                "topic": topic,
+                "preset": "private_chat",
+                "room_alias_name": suffix,
+            }
+        )
+        # m.space.child on the space points at the room; m.space.parent on the
+        # room points back so clients render the hierarchy.
+        _synapse_request(
+            "PUT",
+            f"/_matrix/client/v3/rooms/{urllib.parse.quote(space_id, safe='')}"
+            f"/state/m.space.child/{urllib.parse.quote(room_id, safe='')}",
+            token=token,
+            body={"via": via, "suggested": True},
+        )
+        _synapse_request(
+            "PUT",
+            f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id, safe='')}"
+            f"/state/m.space.parent/{urllib.parse.quote(space_id, safe='')}",
+            token=token,
+            body={"via": via, "canonical": True},
+        )
+
+
+def _ensure_local_space(username: str) -> None:
+    """Create the instance's local space + default rooms once. Best-effort:
+    failures are logged but don't block onboarding (the owner can still chat)."""
+    settings = load_settings()
+    if settings.get("local_space_created"):
+        return
+    try:
+        _create_local_space_with_rooms(username)
+    except (SSOError, KeyError) as exc:
+        app.logger.error("could not create local space/rooms: %s", exc)
+        return
+    settings = load_settings()
+    settings["local_space_created"] = True
+    save_settings(settings)
 
 
 def _default_account_username() -> str:
@@ -1015,7 +1106,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       {% if community_room_alias %}
       <label class="consent">
         <input type="checkbox" name="join_community" value="1" checked>
-        <span>Join the OpenHost community room.</span>
+        <span>Join the OpenHost community space.</span>
       </label>
       {% endif %}
       <p class="hint">Federation needs a publicly reachable instance.
@@ -1067,10 +1158,18 @@ HELP_TEMPLATE = """<!DOCTYPE html>
         setups without public inbound HTTPS (e.g. some tunnel-only configs).</li>
   </ul>
 
-  <h2>OpenHost community room</h2>
-  <p>Optionally join the shared OpenHost community room to chat with other
-     OpenHost users. This requires federation so your server can reach the
-     community's server. You can leave it off to keep your server fully private.</p>
+  <h2>OpenHost community space</h2>
+  <p>Optionally join the shared OpenHost community space to chat with other
+     OpenHost users. A space is a collection of rooms: joining it gives you the
+     space so you can browse and enter its rooms. This requires federation so
+     your server can reach the community's server. You can leave it off to keep
+     your server fully private.</p>
+
+  <h2>Your rooms</h2>
+  <p>Setup also creates a local <strong>{{ local_space_name }}</strong> space on
+     your own server with a few starter rooms (General, Random, Help) so you have
+     somewhere to chat right away. You can rename, add, or remove rooms from the
+     chat client.</p>
 
   <a class="back" href="/_openhost/community/onboarding">&larr; Back to setup</a>
 </div></body></html>
@@ -1219,6 +1318,12 @@ def community_onboarding():
     # rotating it, keeping the password working from other Matrix clients too.
     _store_owner_password(owner_username, owner_password)
 
+    # Give the fresh instance a local space with a few default rooms so the owner
+    # lands in a populated client instead of an empty one. Best-effort; local
+    # (no federation needed).
+    _ensure_local_space(owner_username)
+
+    settings = load_settings()
     settings["community_username"] = owner_username
     settings["community_onboarded"] = True
     # A community-room join is pending only if the owner opted in AND a room
@@ -1257,7 +1362,9 @@ def community_help():
         server = _server_name()
     except SSOError:
         pass
-    return render_template_string(HELP_TEMPLATE, server_name=server)
+    return render_template_string(
+        HELP_TEMPLATE, server_name=server, local_space_name=DEFAULT_LOCAL_SPACE_NAME
+    )
 
 
 @app.route("/_openhost/community/login")

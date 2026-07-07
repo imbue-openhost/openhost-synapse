@@ -18,7 +18,8 @@ there is no toggle to enable it.
 - The OpenHost **owner is auto-logged-in** via SSO: opening the app with no
   existing session runs a short first-run **onboarding** flow. Onboarding is a
   single account: you pick one username and password, and choose whether to
-  enable federation and join the OpenHost community room (both on by default).
+  enable federation and join the OpenHost community space (both on by default).
+  Setup also creates a local space with a few starter rooms on your own server.
   A separate help page explains the federation/legal/public-reachability
   considerations.
 - After onboarding, opening the app signs that account straight into the client.

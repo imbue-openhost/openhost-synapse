@@ -32,11 +32,12 @@ rm -f "$RESTART_SENTINEL" 2>/dev/null || true
 # openhost_settings.json — source of truth for admin-controlled toggles.
 # Written once on first boot; thereafter managed by the admin UI.
 # ---------------------------------------------------------------------------
-# The canonical OpenHost community room, hardcoded as the default target for the
-# "join the community" flow. Lives on the OpenHost community hub homeserver and
-# is joined over federation. Overridable per instance via
-# OPENHOST_COMMUNITY_ROOM_ALIAS or the admin console.
-DEFAULT_COMMUNITY_ROOM_ALIAS="#openhost-community-general:matrix.openhost.imbue.com"
+# The canonical OpenHost community space, hardcoded as the default target for the
+# "join the community" flow. A space is a room whose child rooms are declared via
+# m.space.child; joining it lets the client browse its rooms. Lives on the
+# OpenHost community hub homeserver and is joined over federation. Overridable per
+# instance via OPENHOST_COMMUNITY_ROOM_ALIAS or the admin console.
+DEFAULT_COMMUNITY_ROOM_ALIAS="#openhost-community:matrix.openhost.imbue.com"
 
 # The alias to seed on first boot: an operator-provided env override wins,
 # otherwise the hardcoded canonical default. Used both when creating the initial
