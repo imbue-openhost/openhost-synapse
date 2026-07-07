@@ -452,7 +452,14 @@ def _synapse_registration_mac(key: bytes, payload: bytes) -> str:
     The inputs are opaque, already-encoded ``bytes`` (a MAC key and a pre-joined
     payload); this helper has no knowledge of what they contain.
     """
-    return hmac.new(key, payload, digestmod=hashlib.sha1).hexdigest()  # noqa: S324 (protocol-mandated MAC, not a password hash)
+    # HMAC-SHA1 is mandated by the Synapse shared-secret registration wire
+    # protocol (server recomputes and compares this exact MAC); it is a keyed
+    # authentication MAC, not password hashing, and the digest is never stored.
+    # The algorithm cannot be changed without breaking registration, so the
+    # weak-hash finding here is a false positive.
+    return hmac.new(  # lgtm[py/weak-sensitive-data-hashing]
+        key, payload, digestmod=hashlib.sha1  # noqa: S324
+    ).hexdigest()  # codeql[py/weak-sensitive-data-hashing]
 
 
 def _shared_secret_register(username: str, password: str, admin: bool) -> dict:
