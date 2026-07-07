@@ -844,7 +844,7 @@ def _render_index(message=None, warning=None):
         settings=settings,
         accounts=accounts,
         server_name=server,
-        owner_username=settings.get("community_username") or "",
+        owner_username=_owner_matrix_username(),
         message=message,
         warning=warning,
     )
@@ -877,7 +877,11 @@ def accounts_remove():
     """Remove (deactivate) an account from the admin console. Refuses to remove
     the owner's auto-login account so SSO keeps working. Does not restart."""
     username = (request.form.get("username") or "").strip().lower()
-    owner = (load_settings().get("community_username") or "").lower()
+    # Use the same resolution SSO uses (_owner_matrix_username), which falls back
+    # to the OpenHost owner username when community_username is unset — otherwise
+    # the guard would be empty on older instances and the real auto-login account
+    # could be removed, breaking SSO.
+    owner = _owner_matrix_username().lower()
     if username and username == owner:
         return _render_index(
             warning="Can't remove the auto-login account. Change it during "
