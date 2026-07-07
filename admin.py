@@ -5,9 +5,13 @@ OpenHost Synapse Admin UI
 Serves a simple web interface at /_openhost/admin for managing:
   - Federation (enable/disable)
   - Open registration (enable/disable)
+  - Chat accounts (create as many as you like, with chosen usernames/passwords)
 
 Settings are persisted to openhost_settings.json in the Synapse data dir.
-On change, homeserver.yaml is patched and Synapse is sent SIGHUP to reload.
+On change, homeserver.yaml is patched and the app restarts itself automatically
+(no manual restart): we write a restart sentinel and stop Synapse, and the
+supervisor in start.sh exits so podman's --restart=unless-stopped policy
+relaunches the container with the new config.
 """
 
 import hashlib
@@ -19,6 +23,7 @@ import secrets
 import signal
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -29,6 +34,13 @@ app = Flask(__name__)
 DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data"))
 SETTINGS_FILE = DATA_DIR / "openhost_settings.json"
 HOMESERVER_YAML = DATA_DIR / "homeserver.yaml"
+# Path of the restart sentinel that start.sh watches. When we want the app to
+# restart (to apply settings), we touch this file and then stop Synapse; the
+# supervisor exits and podman relaunches the container. Kept in sync with
+# start.sh's RESTART_SENTINEL via this env var.
+RESTART_SENTINEL = Path(
+    os.environ.get("OPENHOST_RESTART_SENTINEL", str(DATA_DIR / ".openhost_restart_requested"))
+)
 
 # Synapse listens on localhost:8008 inside the container. The admin/SSO code
 # talks to it directly here, bypassing the OpenHost router + zone_auth (which
@@ -50,7 +62,6 @@ DEFAULT_COMMUNITY_ROOM_ALIAS = "#openhost-community-general:matrix.openhost.imbu
 DEFAULTS = {
     "federation_enabled": False,
     "open_registration": True,
-    "community_enabled": False,
     "community_onboarded": False,
     "community_joined": False,
     # The single string defining which room the "join the community" flow joins.
@@ -175,24 +186,52 @@ def _find_synapse_pids() -> list[int]:
             except (OSError, ValueError):
                 continue
     except OSError as exc:
-        app.logger.error("reload_synapse: could not scan /proc: %s", exc)
+        app.logger.error("_find_synapse_pids: could not scan /proc: %s", exc)
     return pids
 
 
-def reload_synapse() -> bool:
-    """Send SIGHUP to Synapse so it reloads config. Returns True on success."""
+def request_app_restart() -> bool:
+    """Restart the whole app so config changes take effect — no manual step.
+
+    Synapse only reads registration/federation settings at startup (SIGHUP only
+    reloads log config), so applying these reliably requires a real restart.
+
+    Mechanism: write the restart sentinel that start.sh watches, then stop
+    Synapse (SIGTERM). start.sh runs Synapse as a supervised child; when it
+    exits, start.sh (PID 1) exits too, and podman's --restart=unless-stopped
+    policy relaunches the container, which re-renders config from the saved
+    settings on boot.
+
+    Returns True if the restart was successfully initiated. We stop Synapse in a
+    background thread after a short delay so the HTTP response reaches the
+    browser first (the client polls / auto-reloads afterwards).
+    """
     try:
-        pids = _find_synapse_pids()
-        if not pids:
-            app.logger.warning("reload_synapse: no Synapse processes found")
-            return False
-        for pid in pids:
-            os.kill(pid, signal.SIGHUP)
-        app.logger.info("reload_synapse: sent SIGHUP to pids %s", pids)
-        return True
-    except (ValueError, ProcessLookupError, PermissionError) as exc:
-        app.logger.error("reload_synapse: failed to reload Synapse: %s", exc)
+        RESTART_SENTINEL.write_text("restart requested by admin UI\n")
+    except OSError as exc:
+        app.logger.error("request_app_restart: could not write sentinel: %s", exc)
         return False
+
+    pids = _find_synapse_pids()
+    if not pids:
+        # No Synapse yet (e.g. still starting). The sentinel is set; leave it —
+        # but we can't force a restart, so report failure so the UI can advise.
+        app.logger.warning("request_app_restart: no Synapse processes found")
+        return False
+
+    def _do_restart() -> None:
+        import time
+
+        time.sleep(1.5)  # let the HTTP response flush to the browser
+        for pid in _find_synapse_pids():
+            try:
+                os.kill(pid, signal.SIGTERM)
+                app.logger.info("request_app_restart: sent SIGTERM to pid %s", pid)
+            except (ProcessLookupError, PermissionError) as exc:
+                app.logger.error("request_app_restart: kill pid %s failed: %s", pid, exc)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +364,7 @@ TEMPLATE = """<!DOCTYPE html>
 <body>
   <div class="container">
     <h1>Synapse Admin</h1>
-    <p class="subtitle">Manage federation and registration settings for this Matrix server.</p>
+    <p class="subtitle">Manage chat accounts, federation and registration for this Matrix server.</p>
 
     {% if message %}
       <div class="alert alert-success">{{ message }}</div>
@@ -333,6 +372,51 @@ TEMPLATE = """<!DOCTYPE html>
     {% if warning %}
       <div class="alert alert-warning">{{ warning }}</div>
     {% endif %}
+
+    <div class="card">
+      <div class="setting-info" style="margin-bottom:1rem">
+        <h2>Chat accounts</h2>
+        <p>Create as many accounts as you like, each with its own username and
+           password. Share the app URL and these credentials so people can sign
+           in to the chat client.</p>
+      </div>
+      {% if accounts %}
+      <ul style="list-style:none;margin:0 0 1rem;padding:0">
+        {% for a in accounts %}
+        <li style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:#0d1117;border:1px solid #2d3348;border-radius:.4rem;margin-bottom:.4rem">
+          <span style="font-family:monospace;color:#a5b4fc">@{{ a }}:{{ server_name }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p style="font-size:.8rem;color:#64748b;margin-bottom:1rem">No accounts created yet.</p>
+      {% endif %}
+      <form method="POST" action="/_openhost/admin/accounts/create"
+            style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end">
+        <div style="flex:1;min-width:140px">
+          <label for="new_username" style="display:block;font-size:.8rem;color:#94a3b8;margin-bottom:.3rem">Username</label>
+          <input type="text" id="new_username" name="username" required
+            pattern="[a-z0-9._=\\-]+" autocomplete="off"
+            placeholder="alice"
+            style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
+        </div>
+        <div style="flex:1;min-width:140px">
+          <label for="new_password" style="display:block;font-size:.8rem;color:#94a3b8;margin-bottom:.3rem">Password</label>
+          <input type="password" id="new_password" name="password" required
+            minlength="8" autocomplete="new-password"
+            placeholder="at least 8 characters"
+            style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
+        </div>
+        <div style="flex-basis:100%;display:flex;align-items:center;gap:.4rem;margin-top:.25rem">
+          <input type="checkbox" id="new_admin" name="admin" value="1">
+          <label for="new_admin" style="font-size:.8rem;color:#94a3b8;margin:0">Server admin</label>
+        </div>
+        <button type="submit" class="save-btn" style="margin-top:0;width:auto;padding:.55rem 1.25rem">Create account</button>
+      </form>
+      <p style="font-size:.75rem;color:#64748b;margin-top:.75rem">
+        Usernames: lowercase letters, numbers, and . _ = - only. Creating an
+        account does not restart the app.</p>
+    </div>
 
     <form method="POST" action="/_openhost/admin/save">
       <div class="card">
@@ -361,21 +445,6 @@ TEMPLATE = """<!DOCTYPE html>
             <span class="slider"></span>
           </label>
         </div>
-      </div>
-
-      <div class="card">
-        <div class="setting-row">
-          <div class="setting-info">
-            <h2>Community Chat</h2>
-            <p>Serve the built-in web chat client at this app's URL and enable the
-               OpenHost community first-run flow. Requires an app restart to apply.</p>
-          </div>
-          <label class="toggle-label">
-            <input type="checkbox" name="community_enabled" value="1"
-              {% if settings.community_enabled %}checked{% endif %}>
-            <span class="slider"></span>
-          </label>
-        </div>
         <div style="margin-top:1rem">
           <label for="community_room_alias" style="display:block;font-size:.85rem;color:#94a3b8;margin-bottom:.35rem">
             Community room alias (optional)</label>
@@ -390,6 +459,9 @@ TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <button type="submit" class="save-btn">Save &amp; Apply</button>
+      <p style="font-size:.75rem;color:#64748b;margin-top:.75rem;text-align:center">
+        Saving federation or registration changes restarts the app automatically
+        to apply them.</p>
     </form>
   </div>
 </body>
@@ -561,6 +633,39 @@ def _read_server_name_from_yaml() -> str:
     raise SSOError("could not determine server_name")
 
 
+def list_user_localparts() -> list[str]:
+    """Return the localparts of human accounts on this homeserver.
+
+    Excludes the SSO service account(s) we create for owner auto-login and any
+    deactivated users. Uses Synapse's admin user-list API (paginated).
+    """
+    token = _get_admin_token()
+    server = _server_name()
+    localparts: list[str] = []
+    next_token: str | None = None
+    for _ in range(100):  # hard cap on pages to avoid an unbounded loop
+        path = "/_synapse/admin/v2/users?deactivated=false&limit=100"
+        if next_token is not None:
+            path += f"&from={urllib.parse.quote(str(next_token))}"
+        resp = _synapse_request("GET", path, token=token)
+        for u in resp.get("users", []):
+            name = u.get("name", "")  # full @user:server
+            if u.get("deactivated"):
+                continue
+            m = re.match(r"^@([^:]+):(.+)$", name)
+            if not m or m.group(2) != server:
+                continue
+            localpart = m.group(1)
+            # Hide the SSO service accounts (named openhost-sso-admin[-xxxx]).
+            if localpart == SSO_ADMIN_USER or localpart.startswith(SSO_ADMIN_USER + "-"):
+                continue
+            localparts.append(localpart)
+        next_token = resp.get("next_token")
+        if next_token is None:
+            break
+    return sorted(localparts)
+
+
 # Serialize SSO logins: the flow sets a fresh ephemeral password then logs in
 # with it, so two concurrent logins for the same owner could otherwise race
 # (one overwrites the other's password before it logs in). Logins are rare and
@@ -623,10 +728,61 @@ def _sso_login_for_owner_locked(username: str) -> dict:
 # Routes
 # ---------------------------------------------------------------------------
 
+def _render_index(message=None, warning=None):
+    settings = load_settings()
+    server = ""
+    try:
+        server = _server_name()
+    except SSOError:
+        pass
+    accounts = []
+    try:
+        accounts = list_user_localparts()
+    except SSOError as exc:
+        app.logger.warning("index: could not list accounts: %s", exc)
+    return render_template_string(
+        TEMPLATE,
+        settings=settings,
+        accounts=accounts,
+        server_name=server,
+        message=message,
+        warning=warning,
+    )
+
+
 @app.route("/_openhost/admin")
 def index():
-    settings = load_settings()
-    return render_template_string(TEMPLATE, settings=settings, message=None, warning=None)
+    return _render_index()
+
+
+@app.route("/_openhost/admin/accounts/create", methods=["POST"])
+def accounts_create():
+    """Create a Matrix account with an admin-chosen username + password.
+
+    Uses the shared-secret register API (via the SSO admin token path). Does not
+    restart the app — accounts take effect immediately.
+    """
+    username = (request.form.get("username") or "").strip().lower()
+    password = request.form.get("password") or ""
+    is_admin = request.form.get("admin") == "1"
+
+    if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
+        return _render_index(
+            warning="Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
+        )
+    if len(password) < 8:
+        return _render_index(warning="Password must be at least 8 characters.")
+
+    try:
+        _shared_secret_register(username, password, admin=is_admin)
+    except SSOError as exc:
+        detail = str(exc)
+        if "M_USER_IN_USE" in detail or "409" in detail:
+            return _render_index(warning=f"Username '{username}' is already taken.")
+        app.logger.error("accounts_create: registration failed: %s", exc)
+        return _render_index(warning="Could not create account. Check the app logs.")
+
+    return _render_index(message=f"Created account @{username}.")
 
 
 @app.route("/_openhost/admin/save", methods=["POST"])
@@ -634,9 +790,9 @@ def save():
     # Merge onto existing settings so flags not shown on this form (e.g.
     # community_onboarded, set by the onboarding flow) are preserved.
     settings = load_settings()
+    prev = load_settings()
     settings["federation_enabled"] = request.form.get("federation_enabled") == "1"
     settings["open_registration"] = request.form.get("open_registration") == "1"
-    settings["community_enabled"] = request.form.get("community_enabled") == "1"
     if "community_room_alias" in request.form:
         settings["community_room_alias"] = request.form.get("community_room_alias", "").strip()
     save_settings(settings)
@@ -650,23 +806,32 @@ def save():
     except OSError as exc:
         yaml_error = str(exc)
 
-    reloaded = False if yaml_error else reload_synapse()
+    # Only restart when a setting that requires a Synapse restart actually
+    # changed (federation or registration). A no-op save shouldn't bounce the app.
+    needs_restart = (
+        settings["federation_enabled"] != prev["federation_enabled"]
+        or settings["open_registration"] != prev["open_registration"]
+    )
+
+    restarted = False
+    if not yaml_error and needs_restart:
+        restarted = request_app_restart()
 
     warning = None
+    message = None
     if yaml_error:
         warning = f"Settings saved, but could not update homeserver.yaml: {yaml_error}"
-    elif not reloaded:
+    elif not needs_restart:
+        message = "Settings saved."
+    elif restarted:
+        message = "Settings saved. The app is restarting to apply changes — this page will be available again in a moment."
+    else:
         warning = (
-            "Settings saved, but Synapse could not be reloaded automatically. "
-            "Restart the app to apply changes."
+            "Settings saved, but the app could not be restarted automatically. "
+            "Restart the app from your OpenHost dashboard to apply changes."
         )
 
-    return render_template_string(
-        TEMPLATE,
-        settings=settings,
-        message="Settings saved. Restart the app to apply changes." if reloaded else None,
-        warning=warning,
-    )
+    return _render_index(message=message, warning=warning)
 
 
 def _join_community_room(username: str, room_alias: str) -> str:
@@ -678,8 +843,6 @@ def _join_community_room(username: str, room_alias: str) -> str:
     token = session["access_token"]
     # POST /join/{roomIdOrAlias} resolves the alias (over federation if remote)
     # and joins. Idempotent: joining an already-joined room returns the room_id.
-    import urllib.parse
-
     quoted = urllib.parse.quote(room_alias, safe="")
     resp = _synapse_request("POST", f"/_matrix/client/v3/join/{quoted}", token=token, body={})
     return resp.get("room_id", "")
@@ -724,14 +887,20 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   .card p,li{color:#cbd5e1;font-size:.9rem;line-height:1.5}
   ul{margin:.5rem 0 0 1.1rem}
   label{display:block;font-size:.9rem;color:#f1f5f9;margin-bottom:.35rem}
-  input[type=text]{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem}
+  input[type=text],input[type=password]{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem}
   .hint{color:#64748b;font-size:.8rem;margin-top:.35rem}
   .consent{display:flex;gap:.6rem;align-items:flex-start;margin-top:1rem}
   .consent input{margin-top:.2rem}
   .btn{display:block;width:100%;padding:.75rem;background:#6366f1;color:#fff;border:none;border-radius:.5rem;font-size:.95rem;font-weight:500;cursor:pointer;margin-top:1.25rem}
   .btn:hover{background:#4f46e5}
+  .btn-secondary{background:#334155}
+  .btn-secondary:hover{background:#475569}
   .warn{background:#1c1003;border:1px solid #92400e;color:#fbbf24;border-radius:.5rem;padding:.75rem 1rem;font-size:.85rem;margin-bottom:1rem}
+  .ok{background:#052e16;border:1px solid #166534;color:#4ade80;border-radius:.5rem;padding:.75rem 1rem;font-size:.85rem;margin-bottom:1rem}
   .err{color:#f87171;font-size:.85rem;margin-top:.5rem}
+  .acct{display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:#0d1117;border:1px solid #2d3348;border-radius:.4rem;margin-bottom:.4rem;font-family:monospace;color:#a5b4fc;font-size:.85rem}
+  .row{display:flex;gap:.75rem;flex-wrap:wrap}
+  .row>div{flex:1;min-width:150px}
 </style></head>
 <body><div class="container">
   <h1>Welcome to Community Chat</h1>
@@ -740,9 +909,9 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   <div class="card">
     <h2>What this does</h2>
     <p>This runs a private Matrix homeserver on your instance and gives you a web
-       chat client, signed in automatically as the instance owner. You can chat
-       privately, invite others, and — if you opt in — join the wider OpenHost
-       community room.</p>
+       chat client. You can create as many accounts as you like below, each with
+       its own username and password — one for yourself and any for people you
+       want to invite. You'll be signed in automatically as the owner account.</p>
   </div>
 
   <div class="card">
@@ -761,18 +930,59 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  {% if notice %}<div class="ok">{{ notice }}</div>{% endif %}
+
+  <div class="card">
+    <h2>Accounts</h2>
+    {% if accounts %}
+    <div>
+      {% for a in accounts %}
+      <div class="acct">@{{ a }}:{{ server_name }}</div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="hint" style="margin-bottom:1rem">No accounts yet. Create your first one below.</p>
+    {% endif %}
+    <form method="POST" action="/_openhost/community/onboarding">
+      <input type="hidden" name="action" value="create_account">
+      <div class="row">
+        <div>
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" value="{{ suggested }}"
+                 pattern="[a-z0-9._=-]+" required autocomplete="off" placeholder="alice">
+        </div>
+        <div>
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" required
+                 minlength="8" autocomplete="new-password" placeholder="min 8 characters">
+        </div>
+      </div>
+      <p class="hint">Lowercase letters, numbers, and . _ = - only. Matrix address:
+         <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
+      <button type="submit" class="btn btn-secondary">Add account</button>
+    </form>
+  </div>
 
   <form method="POST" action="/_openhost/community/onboarding">
+    <input type="hidden" name="action" value="finish">
     <div class="card">
-      <label for="username">Choose your chat username</label>
-      <input type="text" id="username" name="username" value="{{ suggested }}"
-             pattern="[a-z0-9._=-]+" required autocomplete="off">
-      <p class="hint">Lowercase letters, numbers, and . _ = - only. Your Matrix
-         address will be <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
+      <h2>Finish setup</h2>
+      <p>Pick which account signs you in automatically when you open the app, then
+         finish. You can add more accounts later from the admin console.</p>
+      {% if accounts %}
+      <label for="owner_username" style="margin-top:1rem">Sign in as</label>
+      <select id="owner_username" name="owner_username" required
+              style="width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem">
+        {% for a in accounts %}
+        <option value="{{ a }}">@{{ a }}:{{ server_name }}</option>
+        {% endfor %}
+      </select>
+      {% else %}
+      <p class="hint">Create at least one account above before finishing.</p>
+      {% endif %}
       <label class="consent">
         <input type="checkbox" name="consent" value="1" required>
-        <span>I understand what community chat does and the considerations above,
-              and I want to enable it.</span>
+        <span>I understand what community chat does and the considerations above.</span>
       </label>
     </div>
 
@@ -791,7 +1001,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
     </div>
     {% endif %}
 
-    <button type="submit" class="btn">Enable community chat</button>
+    <button type="submit" class="btn"{% if not accounts %} disabled{% endif %}>Finish &amp; open chat</button>
   </form>
 </div></body></html>
 """
@@ -814,13 +1024,23 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
   <div class="card">
     <p>You opted to join the OpenHost community room
        (<code>{{ room_alias }}</code>). This turned on <strong>federation</strong>.</p>
-    <p><strong>Restart this app</strong> from your OpenHost dashboard to activate
-       federation. Once it restarts, your server will join the community room
-       automatically in the background.</p>
-    <p>You can start using chat now; the community room will appear after the
-       restart completes.</p>
+    <p>The app is <strong>restarting automatically</strong> to activate
+       federation. Once it comes back up, your server joins the community room
+       on its own in the background — no action needed.</p>
+    <p>This page will reconnect when the app is ready.</p>
     <a class="btn" href="/_openhost/community/login">Open chat</a>
   </div>
+  <script>
+    // Poll until the app is back up after the automatic restart, then continue.
+    (function(){
+      function ping(){
+        fetch("/_matrix/client/versions",{cache:"no-store"})
+          .then(function(r){ if(r.ok){ location.replace("/_openhost/community/login"); } })
+          .catch(function(){});
+      }
+      setInterval(ping, 3000);
+    })();
+  </script>
 </div></body></html>
 """
 
@@ -830,15 +1050,30 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
 _USERNAME_RE = re.compile(r"^[a-z0-9._=-]+$")
 
 
+def _render_onboarding(server, room_alias, *, error=None, notice=None, suggested="owner"):
+    accounts = []
+    try:
+        accounts = list_user_localparts()
+    except SSOError as exc:
+        app.logger.warning("onboarding: could not list accounts: %s", exc)
+    return render_template_string(
+        ONBOARDING_TEMPLATE,
+        error=error,
+        notice=notice,
+        suggested=suggested,
+        accounts=accounts,
+        server_name=server,
+        community_room_alias=room_alias,
+    )
+
+
 @app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
 def community_onboarding():
-    """First-run consent + username flow. Owner-only (zone_auth gated)."""
+    """First-run flow: create one or more accounts, then finish. Owner-only
+    (zone_auth gated)."""
     settings = load_settings()
-    if not settings.get("community_enabled", False):
-        return "Community chat is not enabled.", 404
-    # Onboarding is one-time: once done, the Matrix account exists under the
-    # chosen username, so re-running this must not silently re-point it. Send
-    # already-onboarded owners straight to login instead.
+    # Onboarding is one-time: once finished, send already-onboarded owners
+    # straight to login instead.
     if settings.get("community_onboarded", False):
         return redirect("/_openhost/community/login", code=302)
     server = ""
@@ -849,24 +1084,68 @@ def community_onboarding():
 
     room_alias = settings.get("community_room_alias", "")
 
-    if request.method == "POST":
+    if request.method != "POST":
+        return _render_onboarding(server, room_alias)
+
+    action = request.form.get("action", "")
+
+    # --- Create an account (repeatable) ---------------------------------------
+    if action == "create_account":
         username = (request.form.get("username") or "").strip().lower()
-        consent = request.form.get("consent") == "1"
-        join_community = request.form.get("join_community") == "1"
-        error = None
-        if not consent:
-            error = "Please confirm you understand before enabling."
-        elif not username or not _USERNAME_RE.match(username) or username.startswith("_"):
-            error = "Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
-        if error:
-            return render_template_string(
-                ONBOARDING_TEMPLATE,
-                error=error,
-                suggested=username,
-                server_name=server,
-                community_room_alias=room_alias,
+        password = request.form.get("password") or ""
+        if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
+            return _render_onboarding(
+                server, room_alias, suggested=username,
+                error="Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _).",
             )
-        settings["community_username"] = username
+        if len(password) < 8:
+            return _render_onboarding(
+                server, room_alias, suggested=username,
+                error="Password must be at least 8 characters.",
+            )
+        try:
+            _shared_secret_register(username, password, admin=False)
+        except SSOError as exc:
+            detail = str(exc)
+            if "M_USER_IN_USE" in detail or "409" in detail:
+                return _render_onboarding(
+                    server, room_alias, suggested=username,
+                    error=f"Username '{username}' is already taken.",
+                )
+            app.logger.error("onboarding create_account failed: %s", exc)
+            return _render_onboarding(
+                server, room_alias,
+                error="Could not create account. Check the app logs.",
+            )
+        return _render_onboarding(
+            server, room_alias, notice=f"Created @{username}. Add more, or finish below.",
+        )
+
+    # --- Finish onboarding ----------------------------------------------------
+    if action == "finish":
+        consent = request.form.get("consent") == "1"
+        owner_username = (request.form.get("owner_username") or "").strip().lower()
+        join_community = request.form.get("join_community") == "1"
+
+        try:
+            accounts = list_user_localparts()
+        except SSOError:
+            accounts = []
+        if not accounts:
+            return _render_onboarding(
+                server, room_alias, error="Create at least one account before finishing.",
+            )
+        if not consent:
+            return _render_onboarding(
+                server, room_alias, error="Please confirm you understand before finishing.",
+            )
+        # The chosen owner account must be one we actually created.
+        if owner_username not in accounts:
+            return _render_onboarding(
+                server, room_alias, error="Choose which account to sign in as.",
+            )
+
+        settings["community_username"] = owner_username
         settings["community_onboarded"] = True
         save_settings(settings)
 
@@ -875,10 +1154,9 @@ def community_onboarding():
         #
         # Joining a *remote* (federated) room alias requires federation to be
         # enabled AND active in the running Synapse. Enabling federation only
-        # takes effect after an app restart (SIGHUP doesn't reliably reload it),
-        # so we can't reliably join in this same request. Instead we record the
-        # intent + turn federation on, and the join is completed on the next boot
-        # by the background worker in this module (see _complete_pending_community_join).
+        # takes effect after a restart, so we record the intent + turn federation
+        # on, trigger an automatic app restart, and the join completes on the next
+        # boot via _complete_pending_community_join.
         if join_community and room_alias:
             settings = load_settings()
             settings["federation_enabled"] = True
@@ -888,30 +1166,18 @@ def community_onboarding():
                 apply_settings_to_yaml(settings)
             except OSError as exc:
                 app.logger.error("could not apply federation setting: %s", exc)
-                # Don't claim success if we couldn't patch homeserver.yaml; keep the
-                # message generic so filesystem details aren't exposed to the client.
-                return render_template_string(
-                    ONBOARDING_TEMPLATE,
+                return _render_onboarding(
+                    server, room_alias,
                     error="Enabled chat, but could not turn on federation to join the "
                     "community. You can retry from the admin console.",
-                    suggested=username,
-                    server_name=server,
-                    community_room_alias=room_alias,
                 )
-            # Federation only activates on restart; the join then completes
-            # automatically in the background. Tell the owner to restart.
-            return render_template_string(
-                JOIN_PENDING_TEMPLATE, room_alias=room_alias
-            )
+            # Federation activates on the automatic restart; the join then
+            # completes in the background. This page polls and continues.
+            request_app_restart()
+            return render_template_string(JOIN_PENDING_TEMPLATE, room_alias=room_alias)
         return redirect("/_openhost/community/login", code=302)
 
-    return render_template_string(
-        ONBOARDING_TEMPLATE,
-        error=None,
-        suggested="owner",
-        server_name=server,
-        community_room_alias=room_alias,
-    )
+    return _render_onboarding(server, room_alias)
 
 
 @app.route("/_openhost/community/login")
@@ -919,11 +1185,9 @@ def community_login():
     """Owner SSO entrypoint: mint a Matrix session and hand it to the web client.
 
     Only reachable by the OpenHost owner (zone_auth gates this subdomain path).
-    Redirects to onboarding on first run until consent is recorded.
+    Redirects to onboarding on first run until setup is complete.
     """
     settings = load_settings()
-    if not settings.get("community_enabled", False):
-        return "Community chat is not enabled.", 404
     if not settings.get("community_onboarded", False):
         return redirect("/_openhost/community/onboarding", code=302)
     username = _owner_matrix_username()

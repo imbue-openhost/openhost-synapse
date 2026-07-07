@@ -5,31 +5,36 @@ Matrix Synapse homeserver for OpenHost. Runs as a single Docker container:
 - Open registration enabled by default (no email verification required)
 - SQLite database (no external database required)
 - Persistent data in OpenHost's app_data directory
-- Admin UI at `/_openhost/admin` for managing federation and registration
-- Optional built-in **community chat**: a bundled web client (Cinny) with
-  owner single-sign-on and a first-run onboarding flow (off by default)
+- Admin UI at `/_openhost/admin` for managing accounts, federation and registration
+- Built-in **chat client** (Cinny) served at the app root, with owner
+  single-sign-on and a first-run onboarding flow — always on
 
-## Community chat (optional)
+## Chat client
 
-By default this app is a headless homeserver with no web client. Enabling
-**Community Chat** in the admin UI (then restarting the app) turns it into a
-ready-to-use chat client:
+The bundled [Cinny](https://cinny.in) web client is served at the app's URL,
+pinned to this homeserver (custom homeservers disabled). It's always available;
+there is no toggle to enable it.
 
-- The bundled [Cinny](https://cinny.in) web client is served at the app's URL,
-  pinned to this homeserver (custom homeservers disabled).
 - The OpenHost **owner is auto-logged-in** via SSO: opening the app with no
-  existing session runs a first-run **onboarding/consent** flow (explains the
-  feature and the federation/legal/public-reachability considerations, and lets
-  you pick a Matrix username), then signs you straight into the client.
+  existing session runs a first-run **onboarding** flow. Onboarding lets you
+  create **as many accounts as you like** (each with its own username and
+  password), pick which account signs you in automatically, and — optionally —
+  join the wider OpenHost community room. It also explains the
+  federation/legal/public-reachability considerations.
+- After onboarding, opening the app signs the chosen owner account straight into
+  the client.
 - The web client and onboarding are gated by OpenHost zone auth, so only the
   owner can reach them. The Matrix APIs (`/_matrix`, `.well-known`) stay public
-  as usual.
+  as usual, so the accounts you create can sign in from any Matrix client too.
+
+You can create additional accounts at any time from the admin UI
+(`/_openhost/admin`), and share the app URL + credentials with the people you
+want to invite.
 
 Relevant settings in `openhost_settings.json`:
 
 ```json
 {
-  "community_enabled": false,
   "community_onboarded": false,
   "community_username": "owner"
 }
@@ -44,10 +49,12 @@ Implementation notes:
   `m.login.password` to obtain a real `device_id` + access token. Only the
   service account's access token (never a password) is persisted, in
   `openhost_sso.json` (mode 0600).
-- The client is handed the session by a small bootstrap page that seeds Cinny's
-  localStorage session keys and redirects into the app.
-- Community chat requires an app **restart** to take effect (the Caddy routing
-  and web client config are rendered by `start.sh` on boot).
+- Accounts created during onboarding / from the admin UI are registered via
+  Synapse's shared-secret admin register API with the username and password you
+  provide.
+- The client is handed the owner session by a small bootstrap page that seeds
+  Cinny's localStorage session keys and redirects into the app.
+- The Caddy routing and web client config are rendered by `start.sh` on boot.
 
 ## How it works
 
@@ -64,16 +71,33 @@ On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` 
 
 ## Admin UI
 
-Settings for federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
+Accounts, federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
 
-The UI has three toggles:
+The UI provides:
 
+- **Chat accounts** — create as many accounts as you like, each with a chosen
+  username and password (optionally server admin). Creating an account takes
+  effect immediately and does not restart the app.
 - **Open Registration** — allow anyone to create an account without an invitation
 - **Federation** — allow this server to communicate with other Matrix homeservers
-- **Community Chat** — serve the bundled web client + owner SSO/onboarding (see
-  "Community chat" above); requires an app restart to apply
 
-On save, the admin UI updates `openhost_settings.json` and patches `homeserver.yaml`. A restart of the app is required for the changes to take effect (Synapse's SIGHUP only reloads log config, not registration or federation settings).
+On save of Open Registration or Federation, the admin UI updates `openhost_settings.json`, patches `homeserver.yaml`, and **automatically restarts the app** so the changes take effect — no manual restart needed. See "Automatic restarts" below.
+
+## Automatic restarts
+
+Synapse only reads registration and federation settings at startup (SIGHUP just
+reloads log config). Rather than asking the user to manually restart the app,
+this app restarts itself:
+
+- `start.sh` runs Synapse as a supervised child process (it does not `exec`
+  into it). When the admin UI needs to apply a restart-only setting, it writes a
+  restart sentinel and stops Synapse.
+- Synapse exiting unblocks the supervisor, which then exits (PID 1). OpenHost
+  runs containers with podman's `--restart=unless-stopped` policy, so the
+  container is relaunched automatically and `start.sh` re-renders
+  `homeserver.yaml` / the Caddyfile from the saved settings on the fresh boot.
+- The admin UI and onboarding pages poll for the app coming back up and continue
+  automatically, so the user never has to touch the OpenHost dashboard.
 
 Settings are stored in `$OPENHOST_APP_DATA_DIR/openhost_settings.json`:
 ```json
@@ -90,9 +114,9 @@ Federation is **disabled** by default. The start script does two things to ensur
 1. Removes `federation` from the Synapse listener names (only the `client` API is served on port 8008)
 2. Appends `federation_domain_whitelist: []` to `homeserver.yaml`, which blocks all server-to-server communication
 
-The Caddyfile only serves `/.well-known/matrix/client` for client auto-discovery. There is no `/.well-known/matrix/server` endpoint. Port 8448 (the standard Matrix federation port) is not exposed.
+The Caddyfile serves `/.well-known/matrix/client` for client auto-discovery and `/.well-known/matrix/server` (pointing remote servers at port 443) so federation works over standard HTTPS without exposing port 8448. Federation is still blocked at the Synapse level until enabled.
 
-To enable federation, use the admin UI at `/_openhost/admin`.
+To enable federation, use the admin UI at `/_openhost/admin`. The app restarts itself automatically to apply the change.
 
 ## Registration
 
@@ -155,8 +179,9 @@ To change federation or registration settings, use the admin UI. Direct edits to
 
 ## Files
 
-- `Dockerfile` -- extends the official Synapse image with Caddy and Flask for the admin UI
-- `start.sh` -- generates config on first boot, applies settings from `openhost_settings.json` on every boot, starts Caddy, admin UI, and Synapse
-- `Caddyfile.template` -- Caddy config template; routes `/_openhost/admin` to the admin UI and proxies everything else to Synapse
-- `admin.py` -- Flask app serving the admin UI on port 8009
+- `Dockerfile` -- extends the official Synapse image with Caddy, Flask, and the bundled Cinny web client
+- `start.sh` -- generates config on first boot, applies settings from `openhost_settings.json` on every boot, renders the Cinny config, and supervises Caddy, the admin UI, and Synapse (exits to trigger an automatic restart when requested)
+- `Caddyfile.template` -- Caddy config template; serves the Cinny client at the root, routes `/_openhost/*` to the admin/onboarding UI, and proxies `/_matrix` + `/_synapse` to Synapse
+- `admin.py` -- Flask app serving the admin UI, onboarding, and owner SSO on port 8009
+- `webclient-config.template.json` -- Cinny config template (homeserver pinned at boot)
 - `openhost.toml` -- OpenHost app manifest (2048 MB RAM, 2 CPU cores, app_data storage)

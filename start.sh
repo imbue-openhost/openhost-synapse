@@ -15,8 +15,18 @@ export SYNAPSE_CONFIG_PATH="$DATA_DIR/homeserver.yaml"
 export SYNAPSE_DATA_DIR="$DATA_DIR"
 
 SETTINGS_FILE="$DATA_DIR/openhost_settings.json"
+# Sentinel written by the admin UI to request an app restart. If present on
+# boot we clear it; the admin UI creates it and then terminates Synapse (PID of
+# the child of this script), which makes this supervisor exit so podman's
+# --restart=unless-stopped policy relaunches the container with fresh config.
+RESTART_SENTINEL="$DATA_DIR/.openhost_restart_requested"
 
 mkdir -p "$DATA_DIR"
+
+# Clear any stale restart sentinel from a previous boot. The admin UI writes
+# this immediately before asking Synapse to stop; on the fresh boot it has
+# served its purpose, so remove it.
+rm -f "$RESTART_SENTINEL" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # openhost_settings.json — source of truth for admin-controlled toggles.
@@ -40,7 +50,6 @@ if [ ! -f "$SETTINGS_FILE" ]; then
 {
   "federation_enabled": false,
   "open_registration": true,
-  "community_enabled": false,
   "community_onboarded": false,
   "community_joined": false,
   "community_room_alias": "$COMMUNITY_ROOM_ALIAS_SEED"
@@ -71,17 +80,6 @@ except Exception as e:
     print('true')
 ")
 
-COMMUNITY_ENABLED=$(python3 -c "
-import json, sys
-try:
-    with open('$SETTINGS_FILE') as f:
-        d = json.load(f)
-    print('true' if d.get('community_enabled', False) else 'false')
-except Exception as e:
-    sys.stderr.write('Warning: could not read settings file: ' + str(e) + '\n')
-    print('false')
-")
-
 # Backfill the community room alias ONLY when the settings file predates the
 # hardcoded default and has no alias key at all (older instances created before
 # this default existed). We must NOT touch a key that is present-but-empty: the
@@ -110,7 +108,7 @@ if "community_room_alias" not in d:
     print(f"Seeded community_room_alias={seed}")
 PYEOF
 
-echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION community_enabled=$COMMUNITY_ENABLED"
+echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION"
 
 # Synapse's start.py hardcodes a few paths under /data (secret key files,
 # appservices glob).  If persistent storage is elsewhere, symlink individual
@@ -348,13 +346,14 @@ if grep -q "^database:" "$DATA_DIR/homeserver.yaml"; then
 fi
 
 # ---------------------------------------------------------------------------
-# Web client (Cinny) — served at the app root only when community chat is
-# enabled. When disabled (default), the root handler proxies to Synapse so a
-# bare homeserver deployment behaves exactly as before.
+# Web client (Cinny) — always served at the app root. The bundled client is
+# pinned to this homeserver. The OpenHost owner is auto-logged-in via SSO on
+# first open (a first-run guard bounces a session-less client to the SSO/
+# onboarding endpoint). Matrix APIs stay under /_matrix and /_synapse.
 # ---------------------------------------------------------------------------
 WEBROOT="/app/webclient"
-if [ "$COMMUNITY_ENABLED" = "true" ] && [ -d "$WEBROOT" ]; then
-    echo "Community chat enabled — serving bundled web client from $WEBROOT"
+if [ -d "$WEBROOT" ]; then
+    echo "Serving bundled web client (Cinny) from $WEBROOT"
     # Render Cinny's config.json with this zone's homeserver pinned. Community
     # room/space wiring is filled in later once federation + room alias exist;
     # for now feature nothing (empty lists) so the client points only locally.
@@ -389,7 +388,7 @@ PYEOF
 		try_files {path} /index.html
 		file_server"
 else
-    echo "Community chat disabled — root proxies to Synapse (bare homeserver)"
+    echo "Web client not bundled — root proxies to Synapse (bare homeserver)"
     ROOT_HANDLER="reverse_proxy localhost:8008 {
 			header_up Host {header.X-Forwarded-Host}
 		}"
@@ -419,11 +418,62 @@ caddy run --config /app/Caddyfile &
 CADDY_PID=$!
 echo "Caddy started (PID $CADDY_PID)"
 
-# Start the admin UI in background
-OPENHOST_APP_DATA_DIR="$DATA_DIR" SYNAPSE_SERVER_NAME="$SERVER_NAME" python3 /app/admin.py &
+# Start the admin UI in background. It is told the path of the restart sentinel
+# so it can request an app restart (see the supervision loop below).
+OPENHOST_APP_DATA_DIR="$DATA_DIR" \
+    SYNAPSE_SERVER_NAME="$SERVER_NAME" \
+    OPENHOST_RESTART_SENTINEL="$RESTART_SENTINEL" \
+    python3 /app/admin.py &
 ADMIN_PID=$!
 echo "Admin UI started (PID $ADMIN_PID)"
 
-# Hand off to the official Synapse entrypoint
+# ---------------------------------------------------------------------------
+# Supervise Synapse.
+#
+# We deliberately do NOT `exec /start.py`. Instead we run it as a child and
+# wait on it. This lets the admin UI apply settings changes with zero manual
+# steps: it renders new settings, writes the restart sentinel, and stops
+# Synapse. Synapse exiting unblocks the wait below; because the sentinel is
+# present we exit this supervisor (PID 1), and podman's
+# --restart=unless-stopped policy relaunches the whole container, which re-runs
+# this script and re-renders homeserver.yaml/Caddyfile from the new settings.
+#
+# If Synapse exits WITHOUT the sentinel (i.e. it crashed), we also exit so
+# podman restarts us — the behaviour you'd want from a supervisor anyway.
+#
+# Forward termination signals to Synapse so a normal `podman stop` shuts it
+# down cleanly instead of waiting for SIGKILL.
+# ---------------------------------------------------------------------------
+SYNAPSE_PID=""
+term_handler() {
+    echo "start.sh: received termination signal, forwarding to Synapse"
+    [ -n "$SYNAPSE_PID" ] && kill -TERM "$SYNAPSE_PID" 2>/dev/null || true
+}
+trap term_handler TERM INT
+
 echo "Starting Synapse..."
-exec /start.py
+/start.py &
+SYNAPSE_PID=$!
+echo "Synapse started (PID $SYNAPSE_PID)"
+
+# Wait specifically for Synapse. `wait` returns when it exits (or when a trapped
+# signal interrupts it, after which we re-wait for the clean shutdown).
+wait "$SYNAPSE_PID"
+SYNAPSE_EXIT=$?
+# If a signal interrupted the wait, term_handler already forwarded SIGTERM;
+# re-wait so Synapse finishes shutting down before we tear everything down.
+wait "$SYNAPSE_PID" 2>/dev/null || true
+
+echo "Synapse exited (status $SYNAPSE_EXIT). Shutting down supervisor so podman restarts the container."
+
+# Stop the sidecars so the container fully exits (and podman's restart policy
+# brings everything back up cleanly).
+kill "$CADDY_PID" "$ADMIN_PID" 2>/dev/null || true
+
+if [ -f "$RESTART_SENTINEL" ]; then
+    echo "Restart was requested via admin UI; exiting for automatic restart."
+fi
+
+# Non-zero exit is fine: --restart=unless-stopped restarts regardless. Use the
+# child's status when it's a clean/known code, otherwise a generic non-zero.
+exit "${SYNAPSE_EXIT:-1}"
