@@ -926,11 +926,25 @@ def _join_community_room(username: str, room_alias: str) -> str:
     return resp.get("room_id", "")
 
 
+def _default_account_username() -> str:
+    """Suggested default username for the first account, derived from the
+    OpenHost owner's username (OPENHOST_OWNER_USERNAME) so onboarding pre-fills
+    the operator's own name instead of a generic "owner".
+
+    Matrix localparts are restricted (lowercase letters, digits, and . _ = -),
+    so we lowercase and strip anything else. If the result is empty (or the env
+    var is unset), fall back to the stable "owner" default.
+    """
+    raw = os.environ.get("OPENHOST_OWNER_USERNAME", "") or ""
+    sanitized = re.sub(r"[^a-z0-9._=-]", "", raw.strip().lower())
+    return sanitized or "owner"
+
+
 def _owner_matrix_username() -> str:
     """The Matrix localpart for the OpenHost owner. Configurable via onboarding;
-    falls back to a stable default."""
+    falls back to the OpenHost owner username (or a stable default)."""
     settings = load_settings()
-    return settings.get("community_username") or "owner"
+    return settings.get("community_username") or _default_account_username()
 
 
 SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
@@ -1196,7 +1210,9 @@ def create_account(username: str, password: str, admin: bool = False) -> str | N
 
 
 def _render_onboarding(server, room_alias, *, error=None, notice=None,
-                       suggested="owner", need_password=False):
+                       suggested=None, need_password=False):
+    if suggested is None:
+        suggested = _default_account_username()
     accounts = []
     try:
         accounts = list_user_localparts()
