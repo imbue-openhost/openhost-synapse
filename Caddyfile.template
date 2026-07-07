@@ -19,20 +19,33 @@
 		respond `{"m.server":"SERVER_NAME_PLACEHOLDER:443"}`
 	}
 
-	# Admin UI — proxy to the local Flask app.
+	# Admin + onboarding UI — proxy to the local Flask app.
 	# zone_auth already gates all non-Matrix paths, so only the OpenHost owner
-	# can reach this endpoint.
-	handle /_openhost/admin* {
+	# can reach these endpoints.
+	handle /_openhost/* {
 		reverse_proxy localhost:8009
 	}
 
-	# Proxy everything else to Synapse (client-server + federation APIs).
-	handle {
+	# Matrix client-server + federation APIs -> Synapse.
+	handle /_matrix* {
 		reverse_proxy localhost:8008 {
 			# Rewrite the Host header from X-Forwarded-Host so that Synapse
 			# sees the correct origin. The OpenHost router strips Host and
 			# puts the real value in X-Forwarded-Host.
 			header_up Host {header.X-Forwarded-Host}
 		}
+	}
+	handle /_synapse* {
+		reverse_proxy localhost:8008 {
+			header_up Host {header.X-Forwarded-Host}
+		}
+	}
+
+	# Root handler. When the community web client is disabled (default), this
+	# proxies everything else to Synapse so a bare homeserver behaves exactly as
+	# before. When enabled, start.sh replaces this with a file_server that serves
+	# the bundled Cinny SPA (falling back to index.html for client-side routing).
+	handle {
+		ROOT_HANDLER_PLACEHOLDER
 	}
 }

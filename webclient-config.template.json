@@ -1,0 +1,17 @@
+{
+  "defaultHomeserver": 0,
+  "homeserverList": ["SERVER_NAME_PLACEHOLDER"],
+  "allowCustomHomeservers": false,
+
+  "featuredCommunities": {
+    "openAsDefault": false,
+    "spaces": [COMMUNITY_SPACE_PLACEHOLDER],
+    "rooms": [COMMUNITY_ROOM_PLACEHOLDER],
+    "servers": [COMMUNITY_SERVER_PLACEHOLDER]
+  },
+
+  "hashRouter": {
+    "enabled": false,
+    "basename": "/"
+  }
+}
