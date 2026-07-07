@@ -40,8 +40,7 @@ if [ ! -f "$SETTINGS_FILE" ]; then
 {
   "federation_enabled": false,
   "open_registration": true,
-  "community_enabled": false,
-  "community_onboarded": false,
+  "onboarded": false,
   "community_joined": false,
   "community_room_alias": "$COMMUNITY_ROOM_ALIAS_SEED"
 }
@@ -69,17 +68,6 @@ try:
 except Exception as e:
     sys.stderr.write('Warning: could not read settings file: ' + str(e) + '\n')
     print('true')
-")
-
-COMMUNITY_ENABLED=$(python3 -c "
-import json, sys
-try:
-    with open('$SETTINGS_FILE') as f:
-        d = json.load(f)
-    print('true' if d.get('community_enabled', False) else 'false')
-except Exception as e:
-    sys.stderr.write('Warning: could not read settings file: ' + str(e) + '\n')
-    print('false')
 ")
 
 # Backfill the community room alias ONLY when the settings file predates the
@@ -110,7 +98,7 @@ if "community_room_alias" not in d:
     print(f"Seeded community_room_alias={seed}")
 PYEOF
 
-echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION community_enabled=$COMMUNITY_ENABLED"
+echo "Settings: federation_enabled=$FEDERATION_ENABLED open_registration=$OPEN_REGISTRATION"
 
 # Synapse's start.py hardcodes a few paths under /data (secret key files,
 # appservices glob).  If persistent storage is elsewhere, symlink individual
@@ -348,64 +336,27 @@ if grep -q "^database:" "$DATA_DIR/homeserver.yaml"; then
 fi
 
 # ---------------------------------------------------------------------------
-# Web client (Cinny) — served at the app root only when community chat is
-# enabled. When disabled (default), the root handler proxies to Synapse so a
-# bare homeserver deployment behaves exactly as before.
+# Root routing:
+#   - The exact root path "/" goes to the admin app (Flask, :8009), which shows
+#     first-run onboarding (create account) until onboarding is complete, then
+#     redirects to Synapse / the admin console. Onboarded state can change at
+#     runtime, so the decision must be made per-request by the app — not baked
+#     into the Caddyfile at boot.
+#   - Everything else (the Matrix client/federation API, .well-known, media,
+#     the /_openhost admin + onboarding routes) proxies to Synapse or the admin
+#     app as appropriate. See Caddyfile.template.
 # ---------------------------------------------------------------------------
-WEBROOT="/app/webclient"
-if [ "$COMMUNITY_ENABLED" = "true" ] && [ -d "$WEBROOT" ]; then
-    echo "Community chat enabled — serving bundled web client from $WEBROOT"
-    # Render Cinny's config.json with this zone's homeserver pinned. Community
-    # room/space wiring is filled in later once federation + room alias exist;
-    # for now feature nothing (empty lists) so the client points only locally.
-    if [ -f /app/webclient-config.template.json ]; then
-        sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
-            -e "s|COMMUNITY_SPACE_PLACEHOLDER||g" \
-            -e "s|COMMUNITY_ROOM_PLACEHOLDER||g" \
-            -e "s|COMMUNITY_SERVER_PLACEHOLDER||g" \
-            /app/webclient-config.template.json > "$WEBROOT/config.json"
-        echo "Rendered web client config.json (homeserver=$SERVER_NAME)"
-    fi
-    # Inject a first-run guard into index.html: if the client has no session yet,
-    # bounce to the OpenHost SSO/onboarding endpoint. Idempotent (only injects
-    # once). This is what makes the owner hit onboarding on first open without
-    # having to serve Cinny from a subpath.
-    if [ -f "$WEBROOT/index.html" ] && ! grep -q "openhost-firstrun-guard" "$WEBROOT/index.html"; then
-        GUARD='<script id="openhost-firstrun-guard">if(!localStorage.getItem("cinny_access_token")&&location.pathname==="/"){location.replace("/_openhost/community/login");}</script>'
-        # Insert right after <head> so it runs before Cinny boots.
-        python3 - "$WEBROOT/index.html" "$GUARD" <<'PYEOF'
-import sys
-path, guard = sys.argv[1], sys.argv[2]
-html = open(path).read()
-if "openhost-firstrun-guard" not in html:
-    html = html.replace("<head>", "<head>" + guard, 1)
-    open(path, "w").write(html)
-PYEOF
-        echo "Injected first-run guard into web client index.html"
-    fi
-    # file_server for the SPA; unmatched paths fall back to index.html so
-    # Cinny's client-side router works on deep links / refresh.
-    ROOT_HANDLER="root * ${WEBROOT}
-		try_files {path} /index.html
-		file_server"
-else
-    echo "Community chat disabled — root proxies to Synapse (bare homeserver)"
-    ROOT_HANDLER="reverse_proxy localhost:8008 {
-			header_up Host {header.X-Forwarded-Host}
-		}"
-fi
+echo "Root path -> onboarding/admin app; homeserver API -> Synapse"
 
-# Generate Caddyfile from template with .well-known client discovery.
-# Use a Python replacement for the root handler because it may span multiple
-# lines (sed with newlines is fragile).
-export ROOT_HANDLER
+# Generate Caddyfile from template, filling in the server name + public base URL
+# for .well-known discovery. Routing is static (root -> onboarding/admin app,
+# everything else -> Synapse), so no dynamic root handler is needed.
 python3 - "$SERVER_NAME" "$PUBLIC_BASEURL" <<'PYEOF'
-import os, sys
+import sys
 server_name, public_baseurl = sys.argv[1], sys.argv[2]
 tpl = open("/app/Caddyfile.template").read()
 tpl = tpl.replace("SERVER_NAME_PLACEHOLDER", server_name)
 tpl = tpl.replace("PUBLIC_BASEURL_PLACEHOLDER", public_baseurl)
-tpl = tpl.replace("ROOT_HANDLER_PLACEHOLDER", os.environ["ROOT_HANDLER"])
 open("/app/Caddyfile", "w").write(tpl)
 PYEOF
 echo "well-known: client_base=${PUBLIC_BASEURL}"

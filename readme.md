@@ -6,48 +6,58 @@ Matrix Synapse homeserver for OpenHost. Runs as a single Docker container:
 - SQLite database (no external database required)
 - Persistent data in OpenHost's app_data directory
 - Admin UI at `/_openhost/admin` for managing federation and registration
-- Optional built-in **community chat**: a bundled web client (Cinny) with
-  owner single-sign-on and a first-run onboarding flow (off by default)
+- First-run **onboarding**: the first time you open the app, you create your
+  Matrix account (username + password) and optionally join the OpenHost
+  community; afterwards you connect with any Matrix client (e.g. Element)
 
-## Community chat (optional)
+## Design intent
 
-By default this app is a headless homeserver with no web client. Enabling
-**Community Chat** in the admin UI (then restarting the app) turns it into a
-ready-to-use chat client:
+This app is intentionally a plain Matrix homeserver, not a chat product:
 
-- The bundled [Cinny](https://cinny.in) web client is served at the app's URL,
-  pinned to this homeserver (custom homeservers disabled).
-- The OpenHost **owner is auto-logged-in** via SSO: opening the app with no
-  existing session runs a first-run **onboarding/consent** flow (explains the
-  feature and the federation/legal/public-reachability considerations, and lets
-  you pick a Matrix username), then signs you straight into the client.
-- The web client and onboarding are gated by OpenHost zone auth, so only the
-  owner can reach them. The Matrix APIs (`/_matrix`, `.well-known`) stay public
-  as usual.
+- **No bundled/integrated web chat client** (no Cinny) and no owner SSO
+  auto-login. Users connect from an external Matrix client (Element).
+- **Onboarding is the default first-run flow**, shown automatically on first
+  load of the app root — there is no admin toggle to enable it.
+- Onboarding **creates a real account** where the owner chooses both a username
+  and a password.
+- After onboarding the app is a bare homeserver; onboarding ends by showing
+  **client-connection instructions for Element** (homeserver URL + account).
+
+Keep these constraints in mind for future changes to this app.
+
+## First-run onboarding
+
+The first time the app root is opened, it shows a one-time onboarding screen
+(no admin toggle needed) where the OpenHost owner:
+
+1. Creates their Matrix account by choosing a **username** and **password**
+   (the account is registered directly on this homeserver, as admin).
+2. Optionally opts in to **join the OpenHost community room** — this enables
+   federation so the server can reach the community's homeserver.
+
+When onboarding completes, the app shows connection instructions for setting up
+**Element** (homeserver URL + account) so the owner can sign in from a real
+Matrix client. There is no bundled web client; the app is a plain homeserver.
+
+Onboarding is gated by OpenHost zone auth, so only the owner can reach it. The
+Matrix APIs (`/_matrix`, `.well-known`) stay public as usual. If the community
+opt-in was selected, the join completes automatically in the background after
+the required app restart (federation only activates on restart).
 
 Relevant settings in `openhost_settings.json`:
 
 ```json
 {
-  "community_enabled": false,
-  "community_onboarded": false,
-  "community_username": "owner"
+  "onboarded": false,
+  "owner_username": "",
+  "community_room_alias": "#openhost-community-general:matrix.openhost.imbue.com",
+  "community_joined": false
 }
 ```
 
-Implementation notes:
-
-- SSO mints a Matrix session for the owner by talking to Synapse over
-  `localhost:8008` (bypassing the router/zone-auth): it registers a one-time
-  admin service account via Synapse's registration shared secret, ensures the
-  owner's user exists, sets a fresh ephemeral password, and performs a normal
-  `m.login.password` to obtain a real `device_id` + access token. Only the
-  service account's access token (never a password) is persisted, in
-  `openhost_sso.json` (mode 0600).
-- The client is handed the session by a small bootstrap page that seeds Cinny's
-  localStorage session keys and redirects into the app.
-- Community chat requires an app **restart** to take effect (the Caddy routing
-  and web client config are rendered by `start.sh` on boot).
+The community room alias defaults to the canonical OpenHost community room and
+is overridable via the admin console or the `OPENHOST_COMMUNITY_ROOM_ALIAS`
+environment variable. Leave it blank to hide the community-join opt-in.
 
 ## How it works
 
@@ -66,12 +76,12 @@ On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` 
 
 Settings for federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
 
-The UI has three toggles:
+The UI has:
 
 - **Open Registration** — allow anyone to create an account without an invitation
 - **Federation** — allow this server to communicate with other Matrix homeservers
-- **Community Chat** — serve the bundled web client + owner SSO/onboarding (see
-  "Community chat" above); requires an app restart to apply
+- **OpenHost community room** — the room alias the first-run community-join
+  option connects to (blank hides that option)
 
 On save, the admin UI updates `openhost_settings.json` and patches `homeserver.yaml`. A restart of the app is required for the changes to take effect (Synapse's SIGHUP only reloads log config, not registration or federation settings).
 
@@ -155,8 +165,8 @@ To change federation or registration settings, use the admin UI. Direct edits to
 
 ## Files
 
-- `Dockerfile` -- extends the official Synapse image with Caddy and Flask for the admin UI
+- `Dockerfile` -- extends the official Synapse image with Caddy and Flask for the onboarding/admin app
 - `start.sh` -- generates config on first boot, applies settings from `openhost_settings.json` on every boot, starts Caddy, admin UI, and Synapse
-- `Caddyfile.template` -- Caddy config template; routes `/_openhost/admin` to the admin UI and proxies everything else to Synapse
-- `admin.py` -- Flask app serving the admin UI on port 8009
+- `Caddyfile.template` -- Caddy config template; serves `.well-known`, routes the exact root path and `/_openhost/*` to the onboarding/admin app, and proxies all other paths to Synapse
+- `admin.py` -- Flask app serving first-run onboarding and the admin UI on port 8009
 - `openhost.toml` -- OpenHost app manifest (2048 MB RAM, 2 CPU cores, app_data storage)

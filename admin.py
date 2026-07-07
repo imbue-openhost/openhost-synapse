@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-OpenHost Synapse Admin UI
+OpenHost Synapse admin + first-run onboarding
 
-Serves a simple web interface at /_openhost/admin for managing:
-  - Federation (enable/disable)
-  - Open registration (enable/disable)
+Serves:
+  - /                    first-run redirect: onboarding (until done)
+  - /_openhost/onboarding  create the owner's Matrix account (username +
+                           password) and optionally join the OpenHost community
+  - /_openhost/admin       manage federation, registration, community room alias
 
 Settings are persisted to openhost_settings.json in the Synapse data dir.
 On change, homeserver.yaml is patched and Synapse is sent SIGHUP to reload.
@@ -30,15 +32,17 @@ DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data"))
 SETTINGS_FILE = DATA_DIR / "openhost_settings.json"
 HOMESERVER_YAML = DATA_DIR / "homeserver.yaml"
 
-# Synapse listens on localhost:8008 inside the container. The admin/SSO code
-# talks to it directly here, bypassing the OpenHost router + zone_auth (which
-# only gates the public-facing subdomain, not intra-container localhost calls).
+# Synapse listens on localhost:8008 inside the container. The admin/onboarding
+# code talks to it directly here, bypassing the OpenHost router + zone_auth
+# (which only gates the public-facing subdomain, not intra-container localhost
+# calls) — in particular to create the owner's account via the shared secret.
 SYNAPSE_BASE = os.environ.get("SYNAPSE_LOCAL_URL", "http://localhost:8008")
-# Where we persist the SSO service account's admin access token.
-SSO_STATE_FILE = DATA_DIR / "openhost_sso.json"
+# Where we persist the admin service-account access token used to join the
+# community room over federation on the owner's behalf.
+ADMIN_STATE_FILE = DATA_DIR / "openhost_sso.json"
 # Synapse reserves the leading "_" localpart for appservices, so it can't start
 # with an underscore. Keep it distinctive to avoid clashing with real users.
-SSO_ADMIN_USER = "openhost-sso-admin"
+ADMIN_SERVICE_USER = "openhost-admin-svc"
 
 # The canonical OpenHost community room. This is the room the "join the
 # community" flow joins over federation. It lives on the OpenHost community hub
@@ -50,8 +54,10 @@ DEFAULT_COMMUNITY_ROOM_ALIAS = "#openhost-community-general:matrix.openhost.imbu
 DEFAULTS = {
     "federation_enabled": False,
     "open_registration": True,
-    "community_enabled": False,
-    "community_onboarded": False,
+    # First-run onboarding: on first load of the app root, the owner creates
+    # their Matrix account (username + password) and optionally joins the
+    # OpenHost community. Once done, the root proxies to the bare homeserver.
+    "onboarded": False,
     "community_joined": False,
     # The single string defining which room the "join the community" flow joins.
     # Defaults to the canonical OpenHost community room; can be overridden.
@@ -364,17 +370,11 @@ TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <div class="setting-row">
-          <div class="setting-info">
-            <h2>Community Chat</h2>
-            <p>Serve the built-in web chat client at this app's URL and enable the
-               OpenHost community first-run flow. Requires an app restart to apply.</p>
-          </div>
-          <label class="toggle-label">
-            <input type="checkbox" name="community_enabled" value="1"
-              {% if settings.community_enabled %}checked{% endif %}>
-            <span class="slider"></span>
-          </label>
+        <div class="setting-info">
+          <h2>OpenHost community room</h2>
+          <p>The room the first-run "join the community" option connects to over
+             federation. Leave blank to hide the community-join option during
+             onboarding.</p>
         </div>
         <div style="margin-top:1rem">
           <label for="community_room_alias" style="display:block;font-size:.85rem;color:#94a3b8;margin-bottom:.35rem">
@@ -383,9 +383,6 @@ TEMPLATE = """<!DOCTYPE html>
             value="{{ settings.community_room_alias or '' }}"
             placeholder="#openhost-community-general:matrix.openhost.imbue.com"
             style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
-          <p style="font-size:.75rem;color:#64748b;margin-top:.35rem">
-            The room the onboarding "join the community" opt-in will join. Leave
-            blank to disable the community-join option.</p>
         </div>
       </div>
 
@@ -398,9 +395,10 @@ TEMPLATE = """<!DOCTYPE html>
 
 
 # ---------------------------------------------------------------------------
-# Matrix SSO — mint a Matrix session for the OpenHost owner so the bundled
-# web client starts logged in. All Synapse calls go to localhost:8008 (inside
-# the container), so they are not subject to the router's zone_auth.
+# Synapse admin helpers — talk to Synapse over localhost:8008 (inside the
+# container, so not subject to the router's zone_auth) to create the owner's
+# account during onboarding and, for the community-join opt-in, mint a token
+# for the owner to join the federated community room on their behalf.
 # ---------------------------------------------------------------------------
 
 
@@ -489,18 +487,18 @@ def _shared_secret_register(username: str, password: str, admin: bool) -> dict:
 
 
 def _load_sso_state() -> dict:
-    if SSO_STATE_FILE.exists():
+    if ADMIN_STATE_FILE.exists():
         try:
-            return json.loads(SSO_STATE_FILE.read_text())
+            return json.loads(ADMIN_STATE_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             pass
     return {}
 
 
 def _save_sso_state(state: dict) -> None:
-    SSO_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+    ADMIN_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
     try:
-        os.chmod(SSO_STATE_FILE, 0o600)  # admin token — restrict to owner
+        os.chmod(ADMIN_STATE_FILE, 0o600)  # admin token — restrict to owner
     except OSError:
         pass
 
@@ -520,7 +518,7 @@ def _bootstrap_admin_token() -> tuple[str, str]:
     means a re-bootstrap (e.g. lost state file) can't collide with M_USER_IN_USE.
     """
     unique = secrets.token_hex(6)
-    localpart = f"{SSO_ADMIN_USER}-{unique}"
+    localpart = f"{ADMIN_SERVICE_USER}-{unique}"
     result = _shared_secret_register(localpart, _generate_password(), admin=True)
     return result["access_token"], result.get("user_id", "")
 
@@ -561,62 +559,22 @@ def _read_server_name_from_yaml() -> str:
     raise SSOError("could not determine server_name")
 
 
-# Serialize SSO logins: the flow sets a fresh ephemeral password then logs in
-# with it, so two concurrent logins for the same owner could otherwise race
-# (one overwrites the other's password before it logs in). Logins are rare and
-# fast, so a process-wide lock is the simplest correct fix.
-_sso_lock = threading.Lock()
+# Serialize owner-account creation so two concurrent onboarding submissions
+# can't race. Onboarding is a one-time, single-owner action, so a process-wide
+# lock is the simplest correct guard.
+_onboard_lock = threading.Lock()
 
 
-def sso_login_for_owner(username: str) -> dict:
-    """Ensure the owner's Matrix user exists and mint a fresh session for it.
+def create_owner_account(username: str, password: str) -> str:
+    """Create the owner's Matrix account with the given password.
 
-    We set the owner's password via the admin API, then perform a *normal*
-    client login (m.login.password). Unlike the admin login endpoint, this
-    creates a real device and returns a device_id — which the web client
-    (matrix-js-sdk) requires to initialise a session; a session with an empty
-    device_id is rejected and the client bounces to its own login screen.
-
-    Serialized under _sso_lock so concurrent logins can't race on the password.
-
-    Returns {user_id, access_token, device_id, home_server}.
+    Uses Synapse's shared-secret registration API (localhost, admin=True).
+    Returns the full Matrix user id (@username:server). Raises SSOError on
+    failure (e.g. the username is already taken).
     """
-    with _sso_lock:
-        return _sso_login_for_owner_locked(username)
-
-
-def _sso_login_for_owner_locked(username: str) -> dict:
-    admin_token = _get_admin_token()
-    server = _server_name()
-    user_id = f"@{username}:{server}"
-
-    # Set a fresh, ephemeral password for this login. Idempotent create-or-update.
-    password = _generate_password()
-    _synapse_request(
-        "PUT",
-        f"/_synapse/admin/v2/users/{user_id}",
-        token=admin_token,
-        # logout_devices=False so re-running SSO doesn't kill the owner's other
-        # existing chat sessions (e.g. a mobile client) via the password change.
-        body={"password": password, "logout_devices": False},
-    )
-    # Normal client login -> real device_id + access_token.
-    login = _synapse_request(
-        "POST",
-        "/_matrix/client/v3/login",
-        body={
-            "type": "m.login.password",
-            "identifier": {"type": "m.id.user", "user": username},
-            "password": password,
-            "initial_device_display_name": "OpenHost Community (SSO)",
-        },
-    )
-    return {
-        "user_id": login.get("user_id", user_id),
-        "access_token": login["access_token"],
-        "device_id": login.get("device_id", ""),
-        "home_server": server,
-    }
+    with _onboard_lock:
+        _shared_secret_register(username, password, admin=True)
+        return f"@{username}:{_server_name()}"
 
 
 # ---------------------------------------------------------------------------
@@ -632,11 +590,10 @@ def index():
 @app.route("/_openhost/admin/save", methods=["POST"])
 def save():
     # Merge onto existing settings so flags not shown on this form (e.g.
-    # community_onboarded, set by the onboarding flow) are preserved.
+    # onboarded, set by the first-run flow) are preserved.
     settings = load_settings()
     settings["federation_enabled"] = request.form.get("federation_enabled") == "1"
     settings["open_registration"] = request.form.get("open_registration") == "1"
-    settings["community_enabled"] = request.form.get("community_enabled") == "1"
     if "community_room_alias" in request.form:
         settings["community_room_alias"] = request.form.get("community_room_alias", "").strip()
     save_settings(settings)
@@ -672,47 +629,45 @@ def save():
 def _join_community_room(username: str, room_alias: str) -> str:
     """Join the owner's account to a (federated) room by alias. Returns room_id.
 
-    Federation must already be enabled and active for a remote alias to resolve.
+    The Synapse admin "edit room membership" API only works when the admin is
+    already in the target room, so it cannot join a *remote* (federated) room on
+    the owner's behalf. Instead we mint a login token for the owner via the admin
+    API (no password needed), then perform a normal client-side join with that
+    token — a client join resolves the alias over federation and joins. Federation
+    must already be enabled and active in the running Synapse for a remote alias
+    to resolve.
     """
-    session = sso_login_for_owner(username)
-    token = session["access_token"]
-    # POST /join/{roomIdOrAlias} resolves the alias (over federation if remote)
-    # and joins. Idempotent: joining an already-joined room returns the room_id.
+    admin_token = _get_admin_token()
+    server = _server_name()
+    user_id = f"@{username}:{server}"
     import urllib.parse
 
+    # Admin API: mint a short-lived login token for the owner without their
+    # password, then exchange it for an access token via m.login.token.
+    login_token_resp = _synapse_request(
+        "POST",
+        f"/_synapse/admin/v1/users/{urllib.parse.quote(user_id, safe='')}/login",
+        token=admin_token,
+        body={},
+    )
+    owner_token = login_token_resp["access_token"]
+
     quoted = urllib.parse.quote(room_alias, safe="")
-    resp = _synapse_request("POST", f"/_matrix/client/v3/join/{quoted}", token=token, body={})
+    # Client-side join as the owner: resolves the alias (over federation if
+    # remote) and joins. Idempotent — joining an already-joined room is fine.
+    resp = _synapse_request(
+        "POST",
+        f"/_matrix/client/v3/join/{quoted}",
+        token=owner_token,
+        body={},
+    )
     return resp.get("room_id", "")
-
-
-def _owner_matrix_username() -> str:
-    """The Matrix localpart for the OpenHost owner. Configurable via onboarding;
-    falls back to a stable default."""
-    settings = load_settings()
-    return settings.get("community_username") or "owner"
-
-
-SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Signing in…</title></head>
-<body style="background:#0f1117;color:#e2e8f0;font-family:sans-serif;text-align:center;padding-top:20vh">
-<p>Signing you in to community chat…</p>
-<script>
-try {
-  localStorage.setItem("cinny_access_token", {{ access_token|tojson }});
-  localStorage.setItem("cinny_device_id", {{ device_id|tojson }});
-  localStorage.setItem("cinny_user_id", {{ user_id|tojson }});
-  localStorage.setItem("cinny_hs_base_url", {{ hs_base_url|tojson }});
-} catch (e) {}
-window.location.replace("/");
-</script>
-</body></html>
-"""
 
 
 ONBOARDING_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Set up Community Chat</title>
+<title>Set up your Matrix account</title>
 <style>
   *,*::before,*::after{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
@@ -724,56 +679,43 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   .card p,li{color:#cbd5e1;font-size:.9rem;line-height:1.5}
   ul{margin:.5rem 0 0 1.1rem}
   label{display:block;font-size:.9rem;color:#f1f5f9;margin-bottom:.35rem}
-  input[type=text]{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem}
+  input[type=text],input[type=password]{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem}
   .hint{color:#64748b;font-size:.8rem;margin-top:.35rem}
+  .field{margin-bottom:1rem}
   .consent{display:flex;gap:.6rem;align-items:flex-start;margin-top:1rem}
   .consent input{margin-top:.2rem}
   .btn{display:block;width:100%;padding:.75rem;background:#6366f1;color:#fff;border:none;border-radius:.5rem;font-size:.95rem;font-weight:500;cursor:pointer;margin-top:1.25rem}
   .btn:hover{background:#4f46e5}
-  .warn{background:#1c1003;border:1px solid #92400e;color:#fbbf24;border-radius:.5rem;padding:.75rem 1rem;font-size:.85rem;margin-bottom:1rem}
   .err{color:#f87171;font-size:.85rem;margin-top:.5rem}
 </style></head>
 <body><div class="container">
-  <h1>Welcome to Community Chat</h1>
-  <p class="subtitle">A Matrix-based chat client, built in to your OpenHost instance.</p>
-
-  <div class="card">
-    <h2>What this does</h2>
-    <p>This runs a private Matrix homeserver on your instance and gives you a web
-       chat client, signed in automatically as the instance owner. You can chat
-       privately, invite others, and — if you opt in — join the wider OpenHost
-       community room.</p>
-  </div>
-
-  <div class="card">
-    <h2>Before you continue</h2>
-    <ul>
-      <li><strong>Federation is optional and off by default.</strong> Your server
-          only talks to other Matrix servers (including the OpenHost community) if
-          you enable federation later in the admin console.</li>
-      <li><strong>Running a federated server may carry responsibilities</strong>
-          (content, data, and legal considerations) that vary by jurisdiction.
-          Review these before enabling federation.</li>
-      <li><strong>Federation needs a publicly reachable instance.</strong> It will
-          not work on setups without public inbound HTTPS (e.g. some tunnel-only
-          configurations).</li>
-    </ul>
-  </div>
+  <h1>Welcome to your Matrix server</h1>
+  <p class="subtitle">Create your account to get started. This runs a private
+     Matrix (Synapse) homeserver on your OpenHost instance.</p>
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
 
-  <form method="POST" action="/_openhost/community/onboarding">
+  <form method="POST" action="/_openhost/onboarding">
     <div class="card">
-      <label for="username">Choose your chat username</label>
-      <input type="text" id="username" name="username" value="{{ suggested }}"
-             pattern="[a-z0-9._=-]+" required autocomplete="off">
-      <p class="hint">Lowercase letters, numbers, and . _ = - only. Your Matrix
-         address will be <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
-      <label class="consent">
-        <input type="checkbox" name="consent" value="1" required>
-        <span>I understand what community chat does and the considerations above,
-              and I want to enable it.</span>
-      </label>
+      <div class="field">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" value="{{ suggested }}"
+               pattern="[a-z0-9._=-]+" required autocomplete="off">
+        <p class="hint">Lowercase letters, numbers, and . _ = - only. Your Matrix
+           address will be <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required
+               autocomplete="new-password" minlength="8">
+        <p class="hint">At least 8 characters. You'll use this to sign in from a
+           Matrix client such as Element.</p>
+      </div>
+      <div class="field">
+        <label for="confirm_password">Confirm password</label>
+        <input type="password" id="confirm_password" name="confirm_password"
+               required autocomplete="new-password">
+      </div>
     </div>
 
     {% if community_room_alias %}
@@ -782,8 +724,8 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       <p>Optionally join the OpenHost community room
          (<code>{{ community_room_alias }}</code>) to chat with other OpenHost
          users. This <strong>enables federation</strong> so your server can reach
-         the community's server — review the considerations above first. You can
-         also do this later, or leave it off to keep your server fully private.</p>
+         the community's server. Leave it off to keep your server fully private;
+         you can enable federation later from the admin console.</p>
       <label class="consent">
         <input type="checkbox" name="join_community" value="1">
         <span>Yes, enable federation and join the OpenHost community room.</span>
@@ -791,36 +733,74 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
     </div>
     {% endif %}
 
-    <button type="submit" class="btn">Enable community chat</button>
+    <button type="submit" class="btn">Create account</button>
   </form>
 </div></body></html>
 """
 
-JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
+# Shown once onboarding is complete: connection instructions for Element.
+CONNECT_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Almost there</title>
+<title>Connect with Element</title>
 <style>
+  *,*::before,*::after{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
-  .container{max-width:560px;margin:0 auto}
-  h1{color:#f8fafc;font-size:1.5rem}
-  .card{background:#1e2130;border:1px solid #2d3348;border-radius:.75rem;padding:1.5rem;margin-top:1rem}
-  p,li{color:#cbd5e1;line-height:1.55}
-  code{color:#a5b4fc}
-  a.btn{display:inline-block;margin-top:1rem;padding:.6rem 1rem;background:#6366f1;color:#fff;border-radius:.5rem;text-decoration:none}
+  .container{max-width:640px;margin:0 auto}
+  h1{font-size:1.55rem;color:#f8fafc;margin-bottom:.25rem}
+  .subtitle{color:#94a3b8;margin-bottom:1.5rem}
+  .card{background:#1e2130;border:1px solid #2d3348;border-radius:.75rem;padding:1.5rem;margin-bottom:1rem}
+  .card h2{font-size:1.05rem;color:#f1f5f9;margin:0 0 .75rem}
+  .card p,li{color:#cbd5e1;font-size:.9rem;line-height:1.55}
+  ol{margin:.25rem 0 0 1.2rem}
+  li{margin-bottom:.4rem}
+  code{color:#a5b4fc;background:#0d1117;padding:.15rem .4rem;border-radius:.3rem;font-size:.85rem}
+  .kv{display:flex;justify-content:space-between;gap:1rem;padding:.5rem 0;border-bottom:1px solid #2d3348}
+  .kv:last-child{border-bottom:none}
+  .kv .k{color:#94a3b8;font-size:.85rem}
+  .kv .v{color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85rem;text-align:right;word-break:break-all}
+  .ok{background:#052e16;border:1px solid #166534;color:#4ade80;border-radius:.5rem;padding:.6rem .9rem;font-size:.85rem;margin-bottom:1rem}
+  a{color:#a5b4fc}
 </style></head>
 <body><div class="container">
-  <h1>Community chat is enabled</h1>
+  <h1>Your account is ready</h1>
+  <p class="subtitle">Connect to your Matrix server from any Matrix client. Below
+     are step-by-step instructions for Element.</p>
+
+  {% if community_note %}<div class="ok">{{ community_note }}</div>{% endif %}
+
   <div class="card">
-    <p>You opted to join the OpenHost community room
-       (<code>{{ room_alias }}</code>). This turned on <strong>federation</strong>.</p>
-    <p><strong>Restart this app</strong> from your OpenHost dashboard to activate
-       federation. Once it restarts, your server will join the community room
-       automatically in the background.</p>
-    <p>You can start using chat now; the community room will appear after the
-       restart completes.</p>
-    <a class="btn" href="/_openhost/community/login">Open chat</a>
+    <h2>Your connection details</h2>
+    <div class="kv"><span class="k">Homeserver URL</span><span class="v">{{ homeserver_url }}</span></div>
+    <div class="kv"><span class="k">Matrix ID</span><span class="v">{{ user_id }}</span></div>
+    <div class="kv"><span class="k">Username</span><span class="v">{{ username }}</span></div>
+    <div class="kv"><span class="k">Password</span><span class="v">the password you just set</span></div>
   </div>
+
+  <div class="card">
+    <h2>Set up Element</h2>
+    <ol>
+      <li>Get Element: use the web app at <a href="https://app.element.io" target="_blank" rel="noopener">app.element.io</a>,
+          or install the desktop/mobile app from
+          <a href="https://element.io/download" target="_blank" rel="noopener">element.io/download</a>.</li>
+      <li>On the Element welcome screen, click <strong>Sign in</strong>.</li>
+      <li>Under the server selector, click <strong>Edit</strong> (next to "Homeserver"),
+          choose <strong>Other homeserver</strong>, and enter:
+          <br><code>{{ homeserver_url }}</code></li>
+      <li>Sign in with your <strong>username</strong> (<code>{{ username }}</code>)
+          and the password you just set.</li>
+      <li>That's it — you're connected to <code>{{ server_name }}</code>.</li>
+    </ol>
+  </div>
+
+  {% if community_room_alias %}
+  <div class="card">
+    <h2>Find the community</h2>
+    <p>Once signed in, open a room by alias and enter
+       <code>{{ community_room_alias }}</code> to join the OpenHost community
+       (requires federation to be enabled).</p>
+  </div>
+  {% endif %}
 </div></body></html>
 """
 
@@ -830,118 +810,133 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
 _USERNAME_RE = re.compile(r"^[a-z0-9._=-]+$")
 
 
-@app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
-def community_onboarding():
-    """First-run consent + username flow. Owner-only (zone_auth gated)."""
+def _public_base_url() -> str:
+    """The public HTTPS base URL of this app (no trailing slash)."""
+    base = os.environ.get("OPENHOST_APP_PUBLIC_URL") or os.environ.get("PUBLIC_BASEURL")
+    if base:
+        return base.rstrip("/")
+    try:
+        return f"https://{_server_name()}"
+    except SSOError:
+        return ""
+
+
+@app.route("/")
+def root():
+    """First-run entrypoint. Caddy routes the exact root path here (:8009).
+
+    Before onboarding, redirect to the onboarding flow. After onboarding, there
+    is nothing to show at the root for a plain homeserver, so redirect to the
+    admin console. (Users connect to the homeserver from a Matrix client such
+    as Element using the instructions shown at the end of onboarding.)
+    """
     settings = load_settings()
-    if not settings.get("community_enabled", False):
-        return "Community chat is not enabled.", 404
-    # Onboarding is one-time: once done, the Matrix account exists under the
-    # chosen username, so re-running this must not silently re-point it. Send
-    # already-onboarded owners straight to login instead.
-    if settings.get("community_onboarded", False):
-        return redirect("/_openhost/community/login", code=302)
+    if settings.get("onboarded", False):
+        return redirect("/_openhost/admin", code=302)
+    return redirect("/_openhost/onboarding", code=302)
+
+
+@app.route("/_openhost/onboarding", methods=["GET", "POST"])
+def onboarding():
+    """First-run account-creation flow (owner-only; zone_auth gates the subdomain).
+
+    Creates the owner's Matrix account with a username + password and, if opted
+    in, enables federation and joins the OpenHost community room. One-time: once
+    onboarded, re-visiting redirects to the connection instructions.
+    """
+    settings = load_settings()
     server = ""
     try:
         server = _server_name()
     except SSOError:
         pass
-
     room_alias = settings.get("community_room_alias", "")
+
+    # One-time: after onboarding, show the connection instructions instead.
+    if settings.get("onboarded", False):
+        return render_template_string(
+            CONNECT_TEMPLATE,
+            homeserver_url=_public_base_url(),
+            user_id=f"@{settings.get('owner_username', '')}:{server}",
+            username=settings.get("owner_username", ""),
+            server_name=server,
+            community_room_alias=room_alias,
+            community_note=None,
+        )
 
     if request.method == "POST":
         username = (request.form.get("username") or "").strip().lower()
-        consent = request.form.get("consent") == "1"
+        password = request.form.get("password") or ""
+        confirm = request.form.get("confirm_password") or ""
         join_community = request.form.get("join_community") == "1"
+
         error = None
-        if not consent:
-            error = "Please confirm you understand before enabling."
-        elif not username or not _USERNAME_RE.match(username) or username.startswith("_"):
+        if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
             error = "Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
+        elif len(password) < 8:
+            error = "Password must be at least 8 characters."
+        elif password != confirm:
+            error = "Passwords do not match."
         if error:
             return render_template_string(
-                ONBOARDING_TEMPLATE,
-                error=error,
-                suggested=username,
-                server_name=server,
-                community_room_alias=room_alias,
+                ONBOARDING_TEMPLATE, error=error, suggested=username,
+                server_name=server, community_room_alias=room_alias,
             )
-        settings["community_username"] = username
-        settings["community_onboarded"] = True
-        save_settings(settings)
 
-        # Explicit, opt-in community join: only if the owner ticked the box AND a
-        # room alias is configured. Never automatic.
-        #
-        # Joining a *remote* (federated) room alias requires federation to be
-        # enabled AND active in the running Synapse. Enabling federation only
-        # takes effect after an app restart (SIGHUP doesn't reliably reload it),
-        # so we can't reliably join in this same request. Instead we record the
-        # intent + turn federation on, and the join is completed on the next boot
-        # by the background worker in this module (see _complete_pending_community_join).
+        # Create the owner's Matrix account with their chosen password.
+        try:
+            user_id = create_owner_account(username, password)
+        except SSOError as exc:
+            app.logger.error("onboarding: account creation failed: %s", exc)
+            msg = "Could not create the account. The username may already be taken."
+            return render_template_string(
+                ONBOARDING_TEMPLATE, error=msg, suggested=username,
+                server_name=server, community_room_alias=room_alias,
+            )
+
+        settings = load_settings()
+        settings["owner_username"] = username
+        settings["onboarded"] = True
+
+        community_note = None
+        # Opt-in community join: only if ticked AND a room alias is configured.
+        # A remote (federated) alias requires federation to be active in the
+        # running Synapse, which only takes effect after an app restart. So we
+        # record the intent + turn federation on; the join completes on the next
+        # boot via _complete_pending_community_join.
         if join_community and room_alias:
-            settings = load_settings()
             settings["federation_enabled"] = True
             settings["community_join_pending"] = True
             save_settings(settings)
             try:
                 apply_settings_to_yaml(settings)
+                community_note = (
+                    "Federation enabled to join the OpenHost community room. "
+                    "Restart this app from your OpenHost dashboard to activate it; "
+                    "your account will join the community room automatically."
+                )
             except OSError as exc:
                 app.logger.error("could not apply federation setting: %s", exc)
-                # Don't claim success if we couldn't patch homeserver.yaml; keep the
-                # message generic so filesystem details aren't exposed to the client.
-                return render_template_string(
-                    ONBOARDING_TEMPLATE,
-                    error="Enabled chat, but could not turn on federation to join the "
-                    "community. You can retry from the admin console.",
-                    suggested=username,
-                    server_name=server,
-                    community_room_alias=room_alias,
+                community_note = (
+                    "Account created, but federation could not be enabled to join "
+                    "the community. You can retry from the admin console."
                 )
-            # Federation only activates on restart; the join then completes
-            # automatically in the background. Tell the owner to restart.
-            return render_template_string(
-                JOIN_PENDING_TEMPLATE, room_alias=room_alias
-            )
-        return redirect("/_openhost/community/login", code=302)
+        else:
+            save_settings(settings)
+
+        return render_template_string(
+            CONNECT_TEMPLATE,
+            homeserver_url=_public_base_url(),
+            user_id=user_id,
+            username=username,
+            server_name=server,
+            community_room_alias=room_alias,
+            community_note=community_note,
+        )
 
     return render_template_string(
-        ONBOARDING_TEMPLATE,
-        error=None,
-        suggested="owner",
-        server_name=server,
-        community_room_alias=room_alias,
-    )
-
-
-@app.route("/_openhost/community/login")
-def community_login():
-    """Owner SSO entrypoint: mint a Matrix session and hand it to the web client.
-
-    Only reachable by the OpenHost owner (zone_auth gates this subdomain path).
-    Redirects to onboarding on first run until consent is recorded.
-    """
-    settings = load_settings()
-    if not settings.get("community_enabled", False):
-        return "Community chat is not enabled.", 404
-    if not settings.get("community_onboarded", False):
-        return redirect("/_openhost/community/onboarding", code=302)
-    username = _owner_matrix_username()
-    try:
-        session = sso_login_for_owner(username)
-    except SSOError as exc:
-        # Log the detail server-side; return a generic message so internal
-        # errors (which may include upstream response bodies) aren't exposed.
-        app.logger.error("community_login: SSO failed: %s", exc)
-        return "Could not sign in to chat. Please try again or check the app logs.", 502
-    # Cinny expects the homeserver base URL it will talk to (same origin).
-    hs_base_url = f"https://{session['home_server']}"
-    return render_template_string(
-        SSO_BOOTSTRAP_TEMPLATE,
-        access_token=session["access_token"],
-        device_id=session["device_id"],
-        user_id=session["user_id"],
-        hs_base_url=hs_base_url,
+        ONBOARDING_TEMPLATE, error=None, suggested="",
+        server_name=server, community_room_alias=room_alias,
     )
 
 
@@ -955,8 +950,8 @@ def _complete_pending_community_join() -> None:
     if not settings.get("community_join_pending"):
         return
     room_alias = settings.get("community_room_alias", "")
-    username = settings.get("community_username") or "owner"
-    if not room_alias:
+    username = settings.get("owner_username") or ""
+    if not room_alias or not username:
         return
 
     # Wait for Synapse's client API to be reachable (up to ~2 min).

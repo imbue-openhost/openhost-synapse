@@ -41,11 +41,19 @@
 		}
 	}
 
-	# Root handler. When the community web client is disabled (default), this
-	# proxies everything else to Synapse so a bare homeserver behaves exactly as
-	# before. When enabled, start.sh replaces this with a file_server that serves
-	# the bundled Cinny SPA (falling back to index.html for client-side routing).
+	# Exact root path -> onboarding/admin app. On first load this shows the
+	# first-run onboarding (create your Matrix account); once onboarded the app
+	# redirects onward. The app decides per-request based on onboarded state.
+	@root path /
+	handle @root {
+		reverse_proxy localhost:8009
+	}
+
+	# Everything else -> Synapse (media, client landing, etc.), so the instance
+	# behaves as a normal homeserver for all Matrix traffic.
 	handle {
-		ROOT_HANDLER_PLACEHOLDER
+		reverse_proxy localhost:8008 {
+			header_up Host {header.X-Forwarded-Host}
+		}
 	}
 }
