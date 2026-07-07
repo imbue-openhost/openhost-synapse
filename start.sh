@@ -28,6 +28,13 @@ mkdir -p "$DATA_DIR"
 # OPENHOST_COMMUNITY_ROOM_ALIAS or the admin console.
 DEFAULT_COMMUNITY_ROOM_ALIAS="#openhost-community-general:matrix.openhost.imbue.com"
 
+# The alias to seed on first boot: an operator-provided env override wins,
+# otherwise the hardcoded canonical default. Used both when creating the initial
+# settings file below and when backfilling older settings files that lack the
+# key. After first boot the value in the settings file is authoritative (the
+# admin console can change or clear it), so this only ever seeds an absent key.
+COMMUNITY_ROOM_ALIAS_SEED="${OPENHOST_COMMUNITY_ROOM_ALIAS:-$DEFAULT_COMMUNITY_ROOM_ALIAS}"
+
 if [ ! -f "$SETTINGS_FILE" ]; then
     cat > "$SETTINGS_FILE" <<EOF
 {
@@ -36,7 +43,7 @@ if [ ! -f "$SETTINGS_FILE" ]; then
   "community_enabled": false,
   "community_onboarded": false,
   "community_joined": false,
-  "community_room_alias": "$DEFAULT_COMMUNITY_ROOM_ALIAS"
+  "community_room_alias": "$COMMUNITY_ROOM_ALIAS_SEED"
 }
 EOF
     echo "Created default settings: $SETTINGS_FILE"
@@ -85,9 +92,10 @@ except Exception as e:
 #
 # OPENHOST_COMMUNITY_ROOM_ALIAS, if set, seeds the alias only when the key is
 # absent (a provisioning-time default), for the same reason — it is not a
-# per-reboot enforcer that would override later admin choices.
-ALIAS_SEED="${OPENHOST_COMMUNITY_ROOM_ALIAS:-$DEFAULT_COMMUNITY_ROOM_ALIAS}"
-python3 - "$SETTINGS_FILE" "$ALIAS_SEED" <<'PYEOF'
+# per-reboot enforcer that would override later admin choices. (On a fresh
+# instance the key is already written above with this same seed value, so this
+# block only fires for older settings files that predate the key.)
+python3 - "$SETTINGS_FILE" "$COMMUNITY_ROOM_ALIAS_SEED" <<'PYEOF'
 import json, sys
 path, seed = sys.argv[1], sys.argv[2]
 try:
