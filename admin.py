@@ -419,7 +419,15 @@ TEMPLATE = """<!DOCTYPE html>
       <ul style="list-style:none;margin:0 0 1rem;padding:0">
         {% for a in accounts %}
         <li style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:#0d1117;border:1px solid #2d3348;border-radius:.4rem;margin-bottom:.4rem">
-          <span style="font-family:monospace;color:#a5b4fc">@{{ a }}:{{ server_name }}</span>
+          <span style="font-family:monospace;color:#a5b4fc">@{{ a }}:{{ server_name }}{% if a == owner_username %} <span style="color:#64748b;font-family:sans-serif;font-size:.7rem">(auto-login)</span>{% endif %}</span>
+          {% if a != owner_username %}
+          <form method="POST" action="/_openhost/admin/accounts/remove" style="margin:0"
+                onsubmit="return confirm('Remove @{{ a }}?')">
+            <input type="hidden" name="username" value="{{ a }}">
+            <button type="submit" title="Remove account"
+                    style="background:none;border:none;color:#f87171;cursor:pointer;font-size:1rem;padding:0 .25rem">&times;</button>
+          </form>
+          {% endif %}
         </li>
         {% endfor %}
       </ul>
@@ -836,6 +844,7 @@ def _render_index(message=None, warning=None):
         settings=settings,
         accounts=accounts,
         server_name=server,
+        owner_username=settings.get("community_username") or "",
         message=message,
         warning=warning,
     )
@@ -861,6 +870,23 @@ def accounts_create():
     if error:
         return _render_index(warning=error)
     return _render_index(message=f"Created account @{username}.")
+
+
+@app.route("/_openhost/admin/accounts/remove", methods=["POST"])
+def accounts_remove():
+    """Remove (deactivate) an account from the admin console. Refuses to remove
+    the owner's auto-login account so SSO keeps working. Does not restart."""
+    username = (request.form.get("username") or "").strip().lower()
+    owner = (load_settings().get("community_username") or "").lower()
+    if username and username == owner:
+        return _render_index(
+            warning="Can't remove the auto-login account. Change it during "
+            "onboarding or the admin console first."
+        )
+    error = delete_account(username)
+    if error:
+        return _render_index(warning=error)
+    return _render_index(message=f"Removed @{username}.")
 
 
 @app.route("/_openhost/admin/save", methods=["POST"])
