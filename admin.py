@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import signal
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -106,15 +107,49 @@ def _set_yaml_bool(content: str, key: str, value: bool) -> str:
 def _patch_federation_listener(content: str, enabled: bool) -> str:
     """
     Add or remove 'federation' from the Synapse listener names list.
-    Handles the inline-list format: names: [client] / names: [client, federation]
-    """
-    def replace_names(m: re.Match) -> str:
-        prefix = m.group(1)
-        return prefix + "[client, federation]" if enabled else prefix + "[client]"
 
-    # Match: (optional dash + spaces) names: [(client)(, federation)?]
-    pattern = r"((?:-\s+)?names:\s*\[)client(?:,\s*federation)?\]"
-    new = re.sub(pattern, replace_names, content)
+    Synapse's generated config uses a multi-line block-list format:
+
+        names:
+        - client
+        - federation
+
+    but an inline list (``names: [client]``) is also valid YAML. Handle both so
+    the listener genuinely reflects the federation setting (leaving 'federation'
+    in the listener when disabled is inconsistent even though the domain
+    whitelist still blocks it).
+    """
+    # --- Inline list: names: [client] / [client, federation] ------------------
+    inline = r"((?:-\s+)?names:\s*\[)\s*client\s*(?:,\s*federation\s*)?\]"
+    if re.search(inline, content):
+        repl = (lambda m: m.group(1) + ("client, federation]" if enabled else "client]"))
+        return re.sub(inline, repl, content)
+
+    # --- Multi-line block list ------------------------------------------------
+    # Find a `names:` key followed by `- <name>` items and rewrite that block.
+    def replace_block(m: re.Match) -> str:
+        header = m.group("header")  # the `names:` line (with indentation)
+        indent = m.group("indent")  # indentation of the `names:` key
+        items_text = m.group("items")
+        # Preserve the item indentation from the first item line.
+        first = re.search(r"^(\s*)-\s*", items_text, flags=re.MULTILINE)
+        item_indent = first.group(1) if first else indent + "  "
+        names = re.findall(r"^\s*-\s*(\S+)\s*$", items_text, flags=re.MULTILINE)
+        names = [n for n in names if n not in ("client", "federation")]
+        rebuilt = ["client"] + (["federation"] if enabled else []) + names
+        # de-dupe while preserving order
+        seen: list[str] = []
+        for n in rebuilt:
+            if n not in seen:
+                seen.append(n)
+        lines = "".join(f"{item_indent}- {n}\n" for n in seen)
+        return f"{header}\n{lines}".rstrip("\n") + "\n"
+
+    block = re.compile(
+        r"(?P<header>(?P<indent>[ \t]*)names:)[ \t]*\n"
+        r"(?P<items>(?:[ \t]*-[ \t]*\S+[ \t]*\n)+)",
+    )
+    new = block.sub(replace_block, content, count=1)
     return new
 
 
@@ -1311,8 +1346,32 @@ def _complete_pending_community_join() -> None:
     app.logger.error("pending community join failed after retries (will retry next boot): %s", last_exc)
 
 
+def _cli_apply_settings() -> int:
+    """Patch homeserver.yaml (registration + federation) from openhost_settings.json.
+
+    Invoked by start.sh on every boot ("python3 admin.py apply-settings") so the
+    boot-time config patching and the admin-UI-time patching share ONE
+    implementation (apply_settings_to_yaml) — no duplicated, drifting regex.
+    """
+    settings = load_settings()
+    if not HOMESERVER_YAML.exists():
+        sys.stderr.write(f"apply-settings: {HOMESERVER_YAML} not found\n")
+        return 0  # nothing to patch yet; not fatal
+    try:
+        apply_settings_to_yaml(settings)
+    except OSError as exc:
+        sys.stderr.write(f"apply-settings: {exc}\n")
+        return 1
+    sys.stderr.write(
+        "apply-settings: federation_enabled=%s open_registration=%s\n"
+        % (settings["federation_enabled"], settings["open_registration"])
+    )
+    return 0
+
+
 if __name__ == "__main__":
-    import threading
+    if len(sys.argv) > 1 and sys.argv[1] == "apply-settings":
+        raise SystemExit(_cli_apply_settings())
 
     threading.Thread(target=_complete_pending_community_join, daemon=True).start()
     port = int(os.environ.get("ADMIN_PORT", "8009"))

@@ -232,92 +232,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Apply federation setting from openhost_settings.json
-# Use Python to reliably patch the YAML listener list and whitelist —
-# sed is fragile against Synapse's varied whitespace/quoting.
+# Apply federation + registration settings from openhost_settings.json.
+# Delegate to admin.py's apply_settings_to_yaml (single source of truth) so the
+# boot-time patching and the admin-UI-time patching can never drift. This
+# robustly rewrites both the (possibly multi-line) listener `names:` list and
+# federation_domain_whitelist, and the enable_registration* flags.
 # ---------------------------------------------------------------------------
-python3 << PYEOF
-import re, sys
-
-path = "$DATA_DIR/homeserver.yaml"
-federation_enabled = "$FEDERATION_ENABLED" == "true"
-
-try:
-    content = open(path).read()
-except OSError as e:
-    sys.stderr.write(f"Warning: could not read homeserver.yaml: {e}\n")
-    sys.exit(0)
-
-# ---- Listener names ----
-# Synapse generates listeners with a "names" list. We need to add or remove
-# "federation" from that list. Handle both inline-list and multi-line formats.
-def set_federation_listener(content, enabled):
-    # Match "- names: [client]" or "- names: [client, federation]" (with optional spaces)
-    # Also handle "names: [client]" without leading dash (inside a list item)
-    def replace_names(m):
-        prefix = m.group(1)  # everything before the list
-        names_str = m.group(2)
-        # Parse the names
-        names = [n.strip().strip("'\"") for n in names_str.split(",")]
-        names = [n for n in names if n and n not in ("client", "federation")]
-        names = ["client"]
-        if enabled:
-            names = ["client", "federation"]
-        return prefix + "[" + ", ".join(names) + "]"
-
-    # Match inline list format: names: [client] or names: [client, federation]
-    pattern = r'((?:- )?names:\s*\[)(client(?:,\s*federation)?)\]'
-    new_content = re.sub(pattern, replace_names, content)
-    if new_content != content:
-        return new_content
-
-    # If no match found and federation_enabled, try to find listener block and ensure federation
-    return content
-
-content = set_federation_listener(content, federation_enabled)
-
-# ---- federation_domain_whitelist ----
-# Remove any existing whitelist lines (and their comments)
-content = re.sub(r'\n# Federation disabled[^\n]*\n', '\n', content)
-content = re.sub(r'^federation_domain_whitelist:.*$', '', content, flags=re.MULTILINE)
-content = re.sub(r'\n{3,}', '\n\n', content)  # collapse excess blank lines
-
-if not federation_enabled:
-    content = content.rstrip() + "\n\n# Federation disabled — personal server.\nfederation_domain_whitelist: []\n"
-
-open(path, "w").write(content)
-if federation_enabled:
-    print("Federation listener enabled, whitelist restriction removed")
-else:
-    print("Federation listener client-only, whitelist blocks all federation")
-PYEOF
-
-# ---------------------------------------------------------------------------
-# Apply registration setting from openhost_settings.json
-# ---------------------------------------------------------------------------
-if [ "$OPEN_REGISTRATION" = "true" ]; then
-    if grep -q "^enable_registration:" "$DATA_DIR/homeserver.yaml"; then
-        sed -i "s|^enable_registration:.*|enable_registration: true|" "$DATA_DIR/homeserver.yaml"
-    else
-        echo "enable_registration: true" >> "$DATA_DIR/homeserver.yaml"
-    fi
-    if grep -q "^enable_registration_without_verification:" "$DATA_DIR/homeserver.yaml"; then
-        sed -i "s|^enable_registration_without_verification:.*|enable_registration_without_verification: true|" "$DATA_DIR/homeserver.yaml"
-    else
-        echo "enable_registration_without_verification: true" >> "$DATA_DIR/homeserver.yaml"
-    fi
-else
-    if grep -q "^enable_registration:" "$DATA_DIR/homeserver.yaml"; then
-        sed -i "s|^enable_registration:.*|enable_registration: false|" "$DATA_DIR/homeserver.yaml"
-    else
-        echo "enable_registration: false" >> "$DATA_DIR/homeserver.yaml"
-    fi
-    if grep -q "^enable_registration_without_verification:" "$DATA_DIR/homeserver.yaml"; then
-        sed -i "s|^enable_registration_without_verification:.*|enable_registration_without_verification: false|" "$DATA_DIR/homeserver.yaml"
-    else
-        echo "enable_registration_without_verification: false" >> "$DATA_DIR/homeserver.yaml"
-    fi
-fi
+OPENHOST_APP_DATA_DIR="$DATA_DIR" python3 /app/admin.py apply-settings || \
+    echo "Warning: apply-settings failed; homeserver.yaml may be stale"
 
 # Always ensure relaxed rate limits (small personal server)
 if ! grep -q "^rc_login:" "$DATA_DIR/homeserver.yaml"; then
