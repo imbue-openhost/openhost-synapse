@@ -16,20 +16,18 @@ pinned to this homeserver (custom homeservers disabled). It's always available;
 there is no toggle to enable it.
 
 - The OpenHost **owner is auto-logged-in** via SSO: opening the app with no
-  existing session runs a first-run **onboarding** flow. Onboarding lets you
-  create **as many accounts as you like** (each with its own username and
-  password), pick which account signs you in automatically, and — optionally —
-  join the wider OpenHost community room. It also explains the
-  federation/legal/public-reachability considerations.
-- After onboarding, opening the app signs the chosen owner account straight into
-  the client.
+  existing session runs a short first-run **onboarding** flow. Onboarding is a
+  single account: you pick one username and password, and choose whether to
+  enable federation and join the OpenHost community room (both on by default).
+  A separate help page explains the federation/legal/public-reachability
+  considerations.
+- After onboarding, opening the app signs that account straight into the client.
 - The web client and onboarding are gated by OpenHost zone auth, so only the
   owner can reach them. The Matrix APIs (`/_matrix`, `.well-known`) stay public
-  as usual, so the accounts you create can sign in from any Matrix client too.
+  as usual, so the same username and password also work from any third-party
+  Matrix client (Element, FluffyChat, etc.).
 
-You can create additional accounts at any time from the admin UI
-(`/_openhost/admin`), and share the app URL + credentials with the people you
-want to invite.
+You can change the account password later from the admin UI (`/_openhost/admin`).
 
 Relevant settings in `openhost_settings.json`:
 
@@ -58,10 +56,9 @@ Implementation notes:
   this behavior existed (no stored owner password), SSO falls back to setting a
   fresh password once via the admin API and then persists it so subsequent
   logins stop rotating.
-- Accounts created during onboarding / from the admin UI are registered via
-  Synapse's shared-secret admin register API with the username and password you
-  provide. Only the owner account's password is stored by the app (for SSO);
-  other accounts' passwords are never persisted by the app.
+- The owner account is registered during onboarding via Synapse's shared-secret
+  admin register API with the username and password you provide. Its password is
+  stored by the app (for SSO); see above.
 - The client is handed the owner session by a small bootstrap page that seeds
   Cinny's localStorage session keys and redirects into the app.
 - The Caddy routing and web client config are rendered by `start.sh` on boot.
@@ -81,13 +78,12 @@ On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` 
 
 ## Admin UI
 
-Accounts, federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
+The chat account, federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
 
 The UI provides:
 
-- **Chat accounts** — create as many accounts as you like, each with a chosen
-  username and password (optionally server admin). Creating an account takes
-  effect immediately and does not restart the app.
+- **Chat account** — shows your account and lets you change its password.
+  Changing the password takes effect immediately and does not restart the app.
 - **Open Registration** — allow anyone to create an account without an invitation
 - **Federation** — allow this server to communicate with other Matrix homeservers
 

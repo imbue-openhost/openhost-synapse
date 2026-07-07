@@ -399,7 +399,7 @@ TEMPLATE = """<!DOCTYPE html>
 <body>
   <div class="container">
     <h1>Synapse Admin</h1>
-    <p class="subtitle">Manage chat accounts, federation and registration for this Matrix server.</p>
+    <p class="subtitle">Manage the chat account, federation and registration for this Matrix server.</p>
 
     {% if message %}
       <div class="alert alert-success">{{ message }}</div>
@@ -410,55 +410,30 @@ TEMPLATE = """<!DOCTYPE html>
 
     <div class="card">
       <div class="setting-info" style="margin-bottom:1rem">
-        <h2>Chat accounts</h2>
-        <p>Create as many accounts as you like, each with its own username and
-           password. Share the app URL and these credentials so people can sign
-           in to the chat client.</p>
+        <h2>Chat account</h2>
+        <p>Your account is signed in automatically in the built-in web client.
+           The password below also works from any third-party Matrix client.</p>
       </div>
-      {% if accounts %}
-      <ul style="list-style:none;margin:0 0 1rem;padding:0">
-        {% for a in accounts %}
-        <li style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:#0d1117;border:1px solid #2d3348;border-radius:.4rem;margin-bottom:.4rem">
-          <span style="font-family:monospace;color:#a5b4fc">@{{ a }}:{{ server_name }}{% if a == owner_username %} <span style="color:#64748b;font-family:sans-serif;font-size:.7rem">(auto-login)</span>{% endif %}</span>
-          {% if a != owner_username %}
-          <form method="POST" action="/_openhost/admin/accounts/remove" style="margin:0"
-                onsubmit="return confirm('Remove @{{ a }}?')">
-            <input type="hidden" name="username" value="{{ a }}">
-            <button type="submit" title="Remove account"
-                    style="background:none;border:none;color:#f87171;cursor:pointer;font-size:1rem;padding:0 .25rem">&times;</button>
-          </form>
-          {% endif %}
-        </li>
-        {% endfor %}
-      </ul>
-      {% else %}
-      <p style="font-size:.8rem;color:#64748b;margin-bottom:1rem">No accounts created yet.</p>
-      {% endif %}
-      <form method="POST" action="/_openhost/admin/accounts/create"
+      {% if owner_username %}
+      <div style="padding:.5rem .75rem;background:#0d1117;border:1px solid #2d3348;border-radius:.4rem;margin-bottom:1rem;font-family:monospace;color:#a5b4fc">
+        @{{ owner_username }}:{{ server_name }}
+      </div>
+      <form method="POST" action="/_openhost/admin/accounts/password"
             style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end">
-        <div style="flex:1;min-width:140px">
-          <label for="new_username" style="display:block;font-size:.8rem;color:#94a3b8;margin-bottom:.3rem">Username</label>
-          <input type="text" id="new_username" name="username" required
-            pattern="[a-z0-9._=\\-]+" autocomplete="off"
-            placeholder="alice"
-            style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
-        </div>
-        <div style="flex:1;min-width:140px">
-          <label for="new_password" style="display:block;font-size:.8rem;color:#94a3b8;margin-bottom:.3rem">Password</label>
+        <div style="flex:1;min-width:180px">
+          <label for="new_password" style="display:block;font-size:.8rem;color:#94a3b8;margin-bottom:.3rem">Change password</label>
           <input type="password" id="new_password" name="password" required
             minlength="8" autocomplete="new-password"
             placeholder="at least 8 characters"
             style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
         </div>
-        <div style="flex-basis:100%;display:flex;align-items:center;gap:.4rem;margin-top:.25rem">
-          <input type="checkbox" id="new_admin" name="admin" value="1">
-          <label for="new_admin" style="font-size:.8rem;color:#94a3b8;margin:0">Server admin</label>
-        </div>
-        <button type="submit" class="save-btn" style="margin-top:0;width:auto;padding:.55rem 1.25rem">Create account</button>
+        <button type="submit" class="save-btn" style="margin-top:0;width:auto;padding:.55rem 1.25rem">Update</button>
       </form>
       <p style="font-size:.75rem;color:#64748b;margin-top:.75rem">
-        Usernames: lowercase letters, numbers, and . _ = - only. Creating an
-        account does not restart the app.</p>
+        Changing the password does not restart the app.</p>
+      {% else %}
+      <p style="font-size:.8rem;color:#64748b">No account set up yet. Open the app to finish setup.</p>
+      {% endif %}
     </div>
 
     <form method="POST" action="/_openhost/admin/save">
@@ -715,31 +690,6 @@ def list_user_localparts() -> list[str]:
 # fast, so a process-wide lock is the simplest correct fix.
 _sso_lock = threading.Lock()
 
-# Passwords typed while creating accounts during the (one-time) onboarding flow,
-# kept only in memory so "Finish setup" can reuse the chosen owner account's
-# password without asking the user to retype it. This is transient onboarding
-# state — it is NOT persisted; only the finally-chosen owner password is written
-# to disk (openhost_sso.json) at finish. Guarded by a lock; cleared once
-# onboarding completes. If the process restarts mid-onboarding this is lost, and
-# finish falls back to prompting for the password.
-_onboarding_passwords: dict[str, str] = {}
-_onboarding_lock = threading.Lock()
-
-
-def _remember_onboarding_password(username: str, password: str) -> None:
-    with _onboarding_lock:
-        _onboarding_passwords[username] = password
-
-
-def _recall_onboarding_password(username: str) -> str | None:
-    with _onboarding_lock:
-        return _onboarding_passwords.get(username)
-
-
-def _clear_onboarding_passwords() -> None:
-    with _onboarding_lock:
-        _onboarding_passwords.clear()
-
 
 def _store_owner_password(username: str, password: str) -> None:
     """Persist the owner account's password in the 0600 SSO state file so SSO can
@@ -834,17 +784,13 @@ def _render_index(message=None, warning=None):
         server = _server_name()
     except SSOError:
         pass
-    accounts = []
-    try:
-        accounts = list_user_localparts()
-    except SSOError as exc:
-        app.logger.warning("index: could not list accounts: %s", exc)
+    # Only show the account card once onboarding has set the owner account;
+    # community_username is empty until then.
     return render_template_string(
         TEMPLATE,
         settings=settings,
-        accounts=accounts,
         server_name=server,
-        owner_username=_owner_matrix_username(),
+        owner_username=settings.get("community_username") or "",
         message=message,
         warning=warning,
     )
@@ -855,42 +801,31 @@ def index():
     return _render_index()
 
 
-@app.route("/_openhost/admin/accounts/create", methods=["POST"])
-def accounts_create():
-    """Create a Matrix account with an admin-chosen username + password.
-
-    Uses the shared-secret register API (via the SSO admin token path). Does not
-    restart the app — accounts take effect immediately.
-    """
-    username = (request.form.get("username") or "").strip().lower()
+@app.route("/_openhost/admin/accounts/password", methods=["POST"])
+def accounts_password():
+    """Change the owner account's password. Updates it in Synapse and in the
+    stored SSO password so auto-login keeps working. Does not restart the app."""
     password = request.form.get("password") or ""
-    is_admin = request.form.get("admin") == "1"
-
-    error = create_account(username, password, admin=is_admin)
-    if error:
-        return _render_index(warning=error)
-    return _render_index(message=f"Created account @{username}.")
-
-
-@app.route("/_openhost/admin/accounts/remove", methods=["POST"])
-def accounts_remove():
-    """Remove (deactivate) an account from the admin console. Refuses to remove
-    the owner's auto-login account so SSO keeps working. Does not restart."""
-    username = (request.form.get("username") or "").strip().lower()
-    # Use the same resolution SSO uses (_owner_matrix_username), which falls back
-    # to the OpenHost owner username when community_username is unset — otherwise
-    # the guard would be empty on older instances and the real auto-login account
-    # could be removed, breaking SSO.
-    owner = _owner_matrix_username().lower()
-    if username and username == owner:
-        return _render_index(
-            warning="Can't remove the auto-login account. Change it during "
-            "onboarding or the admin console first."
+    if len(password) < _MIN_PASSWORD_LEN:
+        return _render_index(warning=f"Password must be at least {_MIN_PASSWORD_LEN} characters.")
+    username = _owner_matrix_username()
+    try:
+        admin_token = _get_admin_token()
+        server = _server_name()
+        user_id = f"@{username}:{server}"
+        # logout_devices=False so changing the password doesn't kill existing
+        # chat sessions (e.g. a mobile client).
+        _synapse_request(
+            "PUT",
+            f"/_synapse/admin/v2/users/{urllib.parse.quote(user_id, safe='')}",
+            token=admin_token,
+            body={"password": password, "logout_devices": False},
         )
-    error = delete_account(username)
-    if error:
-        return _render_index(warning=error)
-    return _render_index(message=f"Removed @{username}.")
+    except SSOError as exc:
+        app.logger.error("accounts_password: could not set password: %s", exc)
+        return _render_index(warning="Could not update password. Check the app logs.")
+    _store_owner_password(username, password)
+    return _render_index(message=f"Password updated for @{username}.")
 
 
 @app.route("/_openhost/admin/save", methods=["POST"])
@@ -1027,7 +962,7 @@ SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
 ONBOARDING_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Set up Community Chat</title>
+<title>Set up chat</title>
 <style>
   *,*::before,*::after{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
@@ -1037,7 +972,6 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   .card{background:#1e2130;border:1px solid #2d3348;border-radius:.75rem;padding:1.5rem;margin-bottom:1rem}
   .card h2{font-size:1.05rem;color:#f1f5f9;margin:0 0 .5rem}
   .card p,li{color:#cbd5e1;font-size:.9rem;line-height:1.5}
-  ul{margin:.5rem 0 0 1.1rem}
   label{display:block;font-size:.9rem;color:#f1f5f9;margin-bottom:.35rem}
   input[type=text],input[type=password]{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem}
   .hint{color:#64748b;font-size:.8rem;margin-top:.35rem}
@@ -1045,44 +979,20 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   .consent input{margin-top:.2rem}
   .btn{display:block;width:100%;padding:.75rem;background:#6366f1;color:#fff;border:none;border-radius:.5rem;font-size:.95rem;font-weight:500;cursor:pointer;margin-top:1.25rem}
   .btn:hover{background:#4f46e5}
-  .btn-secondary{background:#334155}
-  .btn-secondary:hover{background:#475569}
-  .warn{background:#1c1003;border:1px solid #92400e;color:#fbbf24;border-radius:.5rem;padding:.75rem 1rem;font-size:.85rem;margin-bottom:1rem}
-  .ok{background:#052e16;border:1px solid #166534;color:#4ade80;border-radius:.5rem;padding:.75rem 1rem;font-size:.85rem;margin-bottom:1rem}
   .err{color:#f87171;font-size:.85rem;margin-top:.5rem}
-  .acct{display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:#0d1117;border:1px solid #2d3348;border-radius:.4rem;margin-bottom:.4rem;font-family:monospace;color:#a5b4fc;font-size:.85rem}
   .row{display:flex;gap:.75rem;flex-wrap:wrap}
   .row>div{flex:1;min-width:150px}
 </style></head>
 <body><div class="container">
   <h1>Set up chat</h1>
-  <p class="subtitle">Create your accounts, then open chat.
+  <p class="subtitle">Choose your account, then open chat.
      <a href="/_openhost/community/help" style="color:#a5b4fc">Learn more</a>.</p>
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
-  {% if notice %}<div class="ok">{{ notice }}</div>{% endif %}
 
-  <div class="card">
-    <h2>Accounts</h2>
-    {% if accounts %}
-    <div>
-      {% for a in accounts %}
-      <div class="acct">
-        <span>@{{ a }}:{{ server_name }}</span>
-        <form method="POST" action="/_openhost/community/onboarding" style="margin:0">
-          <input type="hidden" name="action" value="remove_account">
-          <input type="hidden" name="username" value="{{ a }}">
-          <button type="submit" title="Remove account"
-                  style="background:none;border:none;color:#f87171;cursor:pointer;font-size:1rem;padding:0 .25rem">&times;</button>
-        </form>
-      </div>
-      {% endfor %}
-    </div>
-    {% else %}
-    <p class="hint" style="margin-bottom:1rem">Add one account for yourself, plus any for people you want to invite.</p>
-    {% endif %}
-    <form method="POST" action="/_openhost/community/onboarding">
-      <input type="hidden" name="action" value="create_account">
+  <form method="POST" action="/_openhost/community/onboarding">
+    <input type="hidden" name="action" value="finish">
+    <div class="card">
       <div class="row">
         <div>
           <label for="username">Username</label>
@@ -1095,29 +1005,8 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
                  minlength="8" autocomplete="new-password" placeholder="min 8 characters">
         </div>
       </div>
-      <button type="submit" class="btn btn-secondary">Add account</button>
-    </form>
-  </div>
-
-  <form method="POST" action="/_openhost/community/onboarding">
-    <input type="hidden" name="action" value="finish">
-    <div class="card">
-      {% if accounts %}
-      <label for="owner_username">Sign in as</label>
-      <select id="owner_username" name="owner_username" required
-              style="width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem">
-        {% for a in accounts %}
-        <option value="{{ a }}"{% if a == suggested %} selected{% endif %}>@{{ a }}:{{ server_name }}</option>
-        {% endfor %}
-      </select>
-      {% if need_password %}
-      <label for="owner_password" style="margin-top:1rem">Password for that account</label>
-      <input type="password" id="owner_password" name="owner_password" required
-             autocomplete="current-password" placeholder="the password you set for it">
-      {% endif %}
-      {% else %}
-      <p class="hint">Add at least one account above first.</p>
-      {% endif %}
+      <p class="hint">You'll be signed in automatically. This password also works
+         from other Matrix clients. Address: <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
 
       <label class="consent">
         <input type="checkbox" name="enable_federation" value="1" checked>
@@ -1133,7 +1022,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
          <a href="/_openhost/community/help" style="color:#a5b4fc">Details</a>.</p>
     </div>
 
-    <button type="submit" class="btn"{% if not accounts %} disabled{% endif %}>Finish &amp; open chat</button>
+    <button type="submit" class="btn">Finish &amp; open chat</button>
   </form>
 </div></body></html>
 """
@@ -1157,15 +1046,15 @@ HELP_TEMPLATE = """<!DOCTYPE html>
 <body><div class="container">
   <h1>Community Chat</h1>
   <p>This runs a private Matrix homeserver on your instance with a built-in web
-     chat client. You sign in automatically as your owner account; other accounts
-     you create can sign in from this client or any Matrix app.</p>
+     chat client. You sign in to it automatically as your account.</p>
 
-  <h2>Accounts</h2>
-  <p>Create as many accounts as you like, each with its own username and password:
-     one for yourself and any for people you want to invite. Usernames use
-     lowercase letters, numbers, and <code>. _ = -</code> only, giving Matrix
-     addresses like <code>@name:{{ server_name }}</code>. You can add or remove
-     accounts later from the admin console.</p>
+  <h2>Your account</h2>
+  <p>You choose one username and password. The built-in web client signs you in
+     automatically, and the same username and password also work from any
+     third-party Matrix client (Element, FluffyChat, etc.). Usernames use
+     lowercase letters, numbers, and <code>. _ = -</code> only, giving a Matrix
+     address like <code>@name:{{ server_name }}</code>. You can change the
+     password later from the admin console.</p>
 
   <h2>Federation</h2>
   <ul>
@@ -1234,9 +1123,8 @@ _MIN_PASSWORD_LEN = 8
 def create_account(username: str, password: str, admin: bool = False) -> str | None:
     """Validate inputs and register a Matrix account via the shared-secret API.
 
-    Returns None on success, or a user-facing error string on failure. Shared by
-    the admin UI (`accounts_create`) and the onboarding `create_account` action
-    so validation and error handling stay identical.
+    Returns None on success, or a user-facing error string on failure. Used by
+    onboarding to create the single owner account.
     """
     username = (username or "").strip().lower()
     password = password or ""
@@ -1255,59 +1143,21 @@ def create_account(username: str, password: str, admin: bool = False) -> str | N
     return None
 
 
-def delete_account(username: str) -> str | None:
-    """Deactivate a Matrix account (used to undo a mistyped account).
-
-    Returns None on success or a user-facing error string. Uses Synapse's admin
-    deactivate API; refuses to touch the SSO service account.
-    """
-    username = (username or "").strip().lower()
-    if not username or not _USERNAME_RE.match(username):
-        return "Invalid username."
-    if username == SSO_ADMIN_USER or username.startswith(SSO_ADMIN_USER + "-"):
-        return "That account can't be removed."
-    try:
-        admin_token = _get_admin_token()
-        server = _server_name()
-        user_id = f"@{username}:{server}"
-        # erase=True fully removes profile data; the account can be re-created
-        # with the same name afterward.
-        _synapse_request(
-            "POST",
-            f"/_synapse/admin/v1/deactivate/{urllib.parse.quote(user_id, safe='')}",
-            token=admin_token,
-            body={"erase": True},
-        )
-    except SSOError as exc:
-        app.logger.error("delete_account: deactivate failed: %s", exc)
-        return "Could not remove account. Check the app logs."
-    return None
-
-
-def _render_onboarding(server, room_alias, *, error=None, notice=None,
-                       suggested=None, need_password=False):
+def _render_onboarding(server, room_alias, *, error=None, suggested=None):
     if suggested is None:
         suggested = _default_account_username()
-    accounts = []
-    try:
-        accounts = list_user_localparts()
-    except SSOError as exc:
-        app.logger.warning("onboarding: could not list accounts: %s", exc)
     return render_template_string(
         ONBOARDING_TEMPLATE,
         error=error,
-        notice=notice,
         suggested=suggested,
-        accounts=accounts,
         server_name=server,
         community_room_alias=room_alias,
-        need_password=need_password,
     )
 
 
 @app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
 def community_onboarding():
-    """First-run flow: create one or more accounts, then finish. Owner-only
+    """First-run flow: set up the single owner account, then finish. Owner-only
     (zone_auth gated)."""
     settings = load_settings()
     # Onboarding is one-time: once finished, send already-onboarded owners
@@ -1325,75 +1175,25 @@ def community_onboarding():
     if request.method != "POST":
         return _render_onboarding(server, room_alias)
 
-    action = request.form.get("action", "")
+    # --- Finish onboarding: create the single owner account -------------------
+    owner_username = (request.form.get("username") or "").strip().lower()
+    owner_password = request.form.get("password") or ""
+    enable_federation = request.form.get("enable_federation") == "1"
+    join_community = request.form.get("join_community") == "1"
+    # Joining the community room requires federation, so a join implies it.
+    if join_community:
+        enable_federation = True
 
-    # --- Create an account (repeatable) ---------------------------------------
-    if action == "create_account":
-        username = (request.form.get("username") or "").strip().lower()
-        password = request.form.get("password") or ""
-        error = create_account(username, password, admin=False)
-        if error:
-            return _render_onboarding(server, room_alias, suggested=username, error=error)
-        # Remember the password in memory so "Finish" can auto-select this account
-        # as the owner without re-prompting.
-        _remember_onboarding_password(username, password)
-        return _render_onboarding(
-            server, room_alias, suggested=username,
-            notice=f"Created @{username}. Add more, or finish below.",
-        )
-
-    # --- Remove an account (fix a typo'd account) -----------------------------
-    if action == "remove_account":
-        username = (request.form.get("username") or "").strip().lower()
-        error = delete_account(username)
-        # Forget any remembered onboarding password for it.
-        with _onboarding_lock:
-            _onboarding_passwords.pop(username, None)
-        if error:
-            return _render_onboarding(server, room_alias, error=error)
-        return _render_onboarding(server, room_alias, notice=f"Removed @{username}.")
-
-    # --- Finish onboarding ----------------------------------------------------
-    if action == "finish":
-        owner_username = (request.form.get("owner_username") or "").strip().lower()
-        enable_federation = request.form.get("enable_federation") == "1"
-        join_community = request.form.get("join_community") == "1"
-        # Joining the community room requires federation, so a join implies it.
-        if join_community:
-            enable_federation = True
-
-        try:
-            accounts = list_user_localparts()
-        except SSOError:
-            accounts = []
-        if not accounts:
-            return _render_onboarding(
-                server, room_alias, error="Create at least one account before finishing.",
-            )
-        # The chosen owner account must be one we actually created.
-        if owner_username not in accounts:
-            return _render_onboarding(
-                server, room_alias, error="Choose which account to sign in as.",
-            )
-
-        # Reuse the password the owner typed when creating this account (kept in
-        # memory during onboarding) so they don't have to retype it. Only if it
-        # was lost (e.g. a mid-onboarding process restart) do we fall back to the
-        # optional re-entry field.
-        owner_password = _recall_onboarding_password(owner_username)
-        if not owner_password:
-            owner_password = request.form.get("owner_password") or ""
-        if not owner_password:
-            return _render_onboarding(
-                server, room_alias, suggested=owner_username, need_password=True,
-                error=f"Re-enter the password for @{owner_username} to finish "
-                "(we couldn't recover the one you set).",
-            )
-
-        # Verify the password for the chosen owner account by attempting a real
-        # login. We persist it (0600) so SSO auto-login reuses it instead of
-        # rotating it — that way the password the owner set keeps working
-        # everywhere (this app and other Matrix clients).
+    # Create the owner's Matrix account (single account). If the name is already
+    # taken, we require the matching password (so re-running with the same
+    # credentials is fine, but you can't hijack an existing account).
+    existing = []
+    try:
+        existing = list_user_localparts()
+    except SSOError:
+        existing = []
+    if owner_username in existing:
+        # Account already exists (e.g. resubmit): verify the password matches.
         try:
             _synapse_request(
                 "POST",
@@ -1407,43 +1207,46 @@ def community_onboarding():
             )
         except SSOError:
             return _render_onboarding(
-                server, room_alias, suggested=owner_username, need_password=True,
-                error=f"That password doesn't match @{owner_username}. Enter the "
-                "password you set for the account you want to sign in as.",
+                server, room_alias, suggested=owner_username,
+                error=f"@{owner_username} already exists and the password doesn't match.",
             )
-        _store_owner_password(owner_username, owner_password)
-        _clear_onboarding_passwords()  # onboarding done; drop transient secrets
+    else:
+        error = create_account(owner_username, owner_password, admin=True)
+        if error:
+            return _render_onboarding(server, room_alias, suggested=owner_username, error=error)
 
-        settings["community_username"] = owner_username
-        settings["community_onboarded"] = True
-        # A community-room join is pending only if the owner opted in AND a room
-        # alias is configured. Joining a remote (federated) alias requires
-        # federation active in the running Synapse, which only takes effect after
-        # a restart, so the join is completed on the next boot by
-        # _complete_pending_community_join.
-        want_join = bool(join_community and room_alias)
-        settings["federation_enabled"] = enable_federation
-        settings["community_join_pending"] = want_join
-        save_settings(settings)
+    # Persist the chosen password (0600) so SSO auto-login reuses it instead of
+    # rotating it, keeping the password working from other Matrix clients too.
+    _store_owner_password(owner_username, owner_password)
 
-        # Applying federation requires patching homeserver.yaml + an app restart.
-        if enable_federation:
-            try:
-                apply_settings_to_yaml(settings)
-            except OSError as exc:
-                app.logger.error("could not apply federation setting: %s", exc)
-                return _render_onboarding(
-                    server, room_alias,
-                    error="Set up chat, but could not turn on federation. You can "
-                    "retry from the admin console.",
-                )
-            # Federation activates on the automatic restart; any pending community
-            # join then completes in the background. This page polls and continues.
-            request_app_restart()
-            return render_template_string(JOIN_PENDING_TEMPLATE)
-        return redirect("/_openhost/community/login", code=302)
+    settings["community_username"] = owner_username
+    settings["community_onboarded"] = True
+    # A community-room join is pending only if the owner opted in AND a room
+    # alias is configured. Joining a remote (federated) alias requires
+    # federation active in the running Synapse, which only takes effect after
+    # a restart, so the join is completed on the next boot by
+    # _complete_pending_community_join.
+    want_join = bool(join_community and room_alias)
+    settings["federation_enabled"] = enable_federation
+    settings["community_join_pending"] = want_join
+    save_settings(settings)
 
-    return _render_onboarding(server, room_alias)
+    # Applying federation requires patching homeserver.yaml + an app restart.
+    if enable_federation:
+        try:
+            apply_settings_to_yaml(settings)
+        except OSError as exc:
+            app.logger.error("could not apply federation setting: %s", exc)
+            return _render_onboarding(
+                server, room_alias,
+                error="Set up chat, but could not turn on federation. You can "
+                "retry from the admin console.",
+            )
+        # Federation activates on the automatic restart; any pending community
+        # join then completes in the background. This page polls and continues.
+        request_app_restart()
+        return render_template_string(JOIN_PENDING_TEMPLATE)
+    return redirect("/_openhost/community/login", code=302)
 
 
 @app.route("/_openhost/community/help")
