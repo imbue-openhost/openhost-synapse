@@ -68,7 +68,7 @@ Implementation notes:
 On first boot, the container:
 1. Generates a `homeserver.yaml` config with the server name derived from OpenHost environment variables (`<app_name>.<zone_domain>`, e.g. `synapse.andrew.host.imbue.com`)
 2. Generates signing keys
-3. Creates `openhost_settings.json` with default settings (federation disabled, open registration enabled)
+3. Creates `openhost_settings.json` with default settings (federation enabled, open registration enabled)
 4. Applies settings from `openhost_settings.json` to `homeserver.yaml`
 5. Appends relaxed rate limits suitable for a small personal server
 6. Generates a Caddyfile with a `.well-known/matrix/client` response for client auto-discovery
@@ -108,7 +108,7 @@ this app restarts itself:
 Settings are stored in `$OPENHOST_APP_DATA_DIR/openhost_settings.json`:
 ```json
 {
-  "federation_enabled": false,
+  "federation_enabled": true,
   "open_registration": true
 }
 ```
