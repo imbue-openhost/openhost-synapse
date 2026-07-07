@@ -673,14 +673,40 @@ def list_user_localparts() -> list[str]:
 _sso_lock = threading.Lock()
 
 
+def _store_owner_password(username: str, password: str) -> None:
+    """Persist the owner account's password in the 0600 SSO state file so SSO can
+    log in as them WITHOUT rotating (overwriting) the password they chose.
+
+    This is what lets the owner keep using the username/password they set during
+    onboarding from other clients (e.g. a phone) — SSO reuses that exact password
+    rather than replacing it with a random one on every auto-login.
+    """
+    state = _load_sso_state()
+    owners = state.get("owner_passwords") or {}
+    owners[username] = password
+    state["owner_passwords"] = owners
+    _save_sso_state(state)
+
+
+def _get_stored_owner_password(username: str) -> str | None:
+    state = _load_sso_state()
+    return (state.get("owner_passwords") or {}).get(username)
+
+
 def sso_login_for_owner(username: str) -> dict:
     """Ensure the owner's Matrix user exists and mint a fresh session for it.
 
-    We set the owner's password via the admin API, then perform a *normal*
-    client login (m.login.password). Unlike the admin login endpoint, this
-    creates a real device and returns a device_id — which the web client
-    (matrix-js-sdk) requires to initialise a session; a session with an empty
-    device_id is rejected and the client bounces to its own login screen.
+    We perform a *normal* client login (m.login.password), which — unlike the
+    admin login endpoint — creates a real device and returns a device_id, which
+    the web client (matrix-js-sdk) requires to initialise a session; a session
+    with an empty device_id is rejected and the client bounces to its own login
+    screen.
+
+    Preferred path: log in with the owner's stored password (chosen during
+    onboarding), so their password is never rotated and keeps working from other
+    clients. Only if no stored password exists (older instances that predate this
+    behaviour) do we fall back to setting a fresh ephemeral password via the admin
+    API — and we persist that so subsequent logins stop rotating too.
 
     Serialized under _sso_lock so concurrent logins can't race on the password.
 
@@ -691,21 +717,26 @@ def sso_login_for_owner(username: str) -> dict:
 
 
 def _sso_login_for_owner_locked(username: str) -> dict:
-    admin_token = _get_admin_token()
     server = _server_name()
     user_id = f"@{username}:{server}"
 
-    # Set a fresh, ephemeral password for this login. Idempotent create-or-update.
-    password = _generate_password()
-    _synapse_request(
-        "PUT",
-        f"/_synapse/admin/v2/users/{user_id}",
-        token=admin_token,
-        # logout_devices=False so re-running SSO doesn't kill the owner's other
-        # existing chat sessions (e.g. a mobile client) via the password change.
-        body={"password": password, "logout_devices": False},
-    )
-    # Normal client login -> real device_id + access_token.
+    password = _get_stored_owner_password(username)
+    if not password:
+        # Backward-compat: no stored password (e.g. instance onboarded before this
+        # change, or SSO state lost). Set one via the admin API and persist it so
+        # future logins reuse it instead of rotating. logout_devices=False so we
+        # don't kill the owner's existing sessions.
+        admin_token = _get_admin_token()
+        password = _generate_password()
+        _synapse_request(
+            "PUT",
+            f"/_synapse/admin/v2/users/{user_id}",
+            token=admin_token,
+            body={"password": password, "logout_devices": False},
+        )
+        _store_owner_password(username, password)
+
+    # Normal client login -> real device_id + access_token. No password change.
     login = _synapse_request(
         "POST",
         "/_matrix/client/v3/login",
@@ -961,9 +992,14 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       <select id="owner_username" name="owner_username" required
               style="width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem">
         {% for a in accounts %}
-        <option value="{{ a }}">@{{ a }}:{{ server_name }}</option>
+        <option value="{{ a }}"{% if a == suggested %} selected{% endif %}>@{{ a }}:{{ server_name }}</option>
         {% endfor %}
       </select>
+      <label for="owner_password" style="margin-top:1rem">Password for that account</label>
+      <input type="password" id="owner_password" name="owner_password" required
+             autocomplete="current-password" placeholder="the password you set for it">
+      <p class="hint">Confirms the account you'll be auto-signed-in as. This
+         password keeps working from other clients too.</p>
       {% else %}
       <p class="hint">Create at least one account above before finishing.</p>
       {% endif %}
@@ -1118,6 +1154,7 @@ def community_onboarding():
     if action == "finish":
         consent = request.form.get("consent") == "1"
         owner_username = (request.form.get("owner_username") or "").strip().lower()
+        owner_password = request.form.get("owner_password") or ""
         join_community = request.form.get("join_community") == "1"
 
         try:
@@ -1130,13 +1167,37 @@ def community_onboarding():
             )
         if not consent:
             return _render_onboarding(
-                server, room_alias, error="Please confirm you understand before finishing.",
+                server, room_alias, suggested=owner_username,
+                error="Please confirm you understand before finishing.",
             )
         # The chosen owner account must be one we actually created.
         if owner_username not in accounts:
             return _render_onboarding(
                 server, room_alias, error="Choose which account to sign in as.",
             )
+
+        # Verify the password for the chosen owner account by attempting a real
+        # login. We persist it (0600) so SSO auto-login reuses it instead of
+        # rotating it — that way the password the owner set keeps working
+        # everywhere (this app and other Matrix clients).
+        try:
+            _synapse_request(
+                "POST",
+                "/_matrix/client/v3/login",
+                body={
+                    "type": "m.login.password",
+                    "identifier": {"type": "m.id.user", "user": owner_username},
+                    "password": owner_password,
+                    "initial_device_display_name": "OpenHost onboarding check",
+                },
+            )
+        except SSOError:
+            return _render_onboarding(
+                server, room_alias, suggested=owner_username,
+                error=f"That password doesn't match @{owner_username}. Enter the "
+                "password you set for the account you want to sign in as.",
+            )
+        _store_owner_password(owner_username, owner_password)
 
         settings["community_username"] = owner_username
         settings["community_onboarded"] = True
