@@ -14,11 +14,12 @@ Durable, project-level decisions. Keep these in mind for future changes.
   (OPENHOST_OWNER_USERNAME), sanitized to a valid Matrix localpart.
 - Onboarding is minimal (little reading). Detailed explanations live on a separate
   help page (/_openhost/community/help).
-- The only onboarding checkboxes are "Enable federation" and "Join the OpenHost
-  community space" — separate checkboxes, both default-checked.
+- Federation is enabled by default (no onboarding checkbox); it can be turned off
+  later from the admin console.
+- The one onboarding checkbox is "Join the OpenHost community space", default-checked.
 - The community-join target is a Matrix space (browse its rooms), not a single
-  room. Onboarding also creates a local space with a few starter rooms on the
-  instance's own homeserver.
+  room. Do NOT auto-create local rooms/spaces on the instance; only the public
+  community-join is wanted.
 - No em-dashes in user-facing text. Use plain punctuation.
 </content>
 </invoke>

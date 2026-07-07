@@ -49,7 +49,7 @@ COMMUNITY_ROOM_ALIAS_SEED="${OPENHOST_COMMUNITY_ROOM_ALIAS:-$DEFAULT_COMMUNITY_R
 if [ ! -f "$SETTINGS_FILE" ]; then
     cat > "$SETTINGS_FILE" <<EOF
 {
-  "federation_enabled": false,
+  "federation_enabled": true,
   "open_registration": true,
   "community_onboarded": false,
   "community_joined": false,
@@ -65,10 +65,10 @@ import json, sys
 try:
     with open('$SETTINGS_FILE') as f:
         d = json.load(f)
-    print('true' if d.get('federation_enabled', False) else 'false')
+    print('true' if d.get('federation_enabled', True) else 'false')
 except Exception as e:
     sys.stderr.write('Warning: could not read settings file: ' + str(e) + '\n')
-    print('false')
+    print('true')
 ")
 OPEN_REGISTRATION=$(python3 -c "
 import json, sys
