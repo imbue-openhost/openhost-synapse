@@ -456,13 +456,21 @@ echo "Starting Synapse..."
 SYNAPSE_PID=$!
 echo "Synapse started (PID $SYNAPSE_PID)"
 
+# Disable errexit for the supervision/teardown section. Synapse almost always
+# exits non-zero on the restart path (SIGTERM -> status 143), and `wait`
+# returning a non-zero child status (or >128 when interrupted by a trapped
+# signal) must NOT abort the script — otherwise the second `wait`, the sidecar
+# cleanup, and the sentinel log below would all be skipped, and on `podman stop`
+# Synapse would never get its clean-shutdown window.
+set +e
+
 # Wait specifically for Synapse. `wait` returns when it exits (or when a trapped
 # signal interrupts it, after which we re-wait for the clean shutdown).
 wait "$SYNAPSE_PID"
 SYNAPSE_EXIT=$?
 # If a signal interrupted the wait, term_handler already forwarded SIGTERM;
 # re-wait so Synapse finishes shutting down before we tear everything down.
-wait "$SYNAPSE_PID" 2>/dev/null || true
+wait "$SYNAPSE_PID" 2>/dev/null
 
 echo "Synapse exited (status $SYNAPSE_EXIT). Shutting down supervisor so podman restarts the container."
 

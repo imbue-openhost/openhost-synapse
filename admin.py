@@ -766,22 +766,9 @@ def accounts_create():
     password = request.form.get("password") or ""
     is_admin = request.form.get("admin") == "1"
 
-    if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
-        return _render_index(
-            warning="Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
-        )
-    if len(password) < 8:
-        return _render_index(warning="Password must be at least 8 characters.")
-
-    try:
-        _shared_secret_register(username, password, admin=is_admin)
-    except SSOError as exc:
-        detail = str(exc)
-        if "M_USER_IN_USE" in detail or "409" in detail:
-            return _render_index(warning=f"Username '{username}' is already taken.")
-        app.logger.error("accounts_create: registration failed: %s", exc)
-        return _render_index(warning="Could not create account. Check the app logs.")
-
+    error = create_account(username, password, admin=is_admin)
+    if error:
+        return _render_index(warning=error)
     return _render_index(message=f"Created account @{username}.")
 
 
@@ -1049,6 +1036,33 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
 # URL handling. Restrict to the safe, portable subset.
 _USERNAME_RE = re.compile(r"^[a-z0-9._=-]+$")
 
+# Minimum password length for accounts created via the admin UI / onboarding.
+_MIN_PASSWORD_LEN = 8
+
+
+def create_account(username: str, password: str, admin: bool = False) -> str | None:
+    """Validate inputs and register a Matrix account via the shared-secret API.
+
+    Returns None on success, or a user-facing error string on failure. Shared by
+    the admin UI (`accounts_create`) and the onboarding `create_account` action
+    so validation and error handling stay identical.
+    """
+    username = (username or "").strip().lower()
+    password = password or ""
+    if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
+        return "Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
+    if len(password) < _MIN_PASSWORD_LEN:
+        return f"Password must be at least {_MIN_PASSWORD_LEN} characters."
+    try:
+        _shared_secret_register(username, password, admin=admin)
+    except SSOError as exc:
+        detail = str(exc)
+        if "M_USER_IN_USE" in detail or "409" in detail:
+            return f"Username '{username}' is already taken."
+        app.logger.error("create_account: registration failed: %s", exc)
+        return "Could not create account. Check the app logs."
+    return None
+
 
 def _render_onboarding(server, room_alias, *, error=None, notice=None, suggested="owner"):
     accounts = []
@@ -1093,30 +1107,9 @@ def community_onboarding():
     if action == "create_account":
         username = (request.form.get("username") or "").strip().lower()
         password = request.form.get("password") or ""
-        if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
-            return _render_onboarding(
-                server, room_alias, suggested=username,
-                error="Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _).",
-            )
-        if len(password) < 8:
-            return _render_onboarding(
-                server, room_alias, suggested=username,
-                error="Password must be at least 8 characters.",
-            )
-        try:
-            _shared_secret_register(username, password, admin=False)
-        except SSOError as exc:
-            detail = str(exc)
-            if "M_USER_IN_USE" in detail or "409" in detail:
-                return _render_onboarding(
-                    server, room_alias, suggested=username,
-                    error=f"Username '{username}' is already taken.",
-                )
-            app.logger.error("onboarding create_account failed: %s", exc)
-            return _render_onboarding(
-                server, room_alias,
-                error="Could not create account. Check the app logs.",
-            )
+        error = create_account(username, password, admin=False)
+        if error:
+            return _render_onboarding(server, room_alias, suggested=username, error=error)
         return _render_onboarding(
             server, room_alias, notice=f"Created @{username}. Add more, or finish below.",
         )
