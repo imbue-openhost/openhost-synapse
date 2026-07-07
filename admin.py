@@ -62,26 +62,16 @@ SSO_ADMIN_USER = "openhost-sso-admin"
 # the OPENHOST_COMMUNITY_ROOM_ALIAS env var.
 DEFAULT_COMMUNITY_ROOM_ALIAS = "#openhost-community:matrix.openhost.imbue.com"
 
-# Default rooms created inside the instance's own local space on first setup, so
-# a fresh instance has ready-to-use rooms instead of an empty client. (localpart
-# alias suffix, display name, topic)
-DEFAULT_LOCAL_SPACE_NAME = "Community"
-DEFAULT_LOCAL_ROOMS = [
-    ("general", "General", "General chat"),
-    ("random", "Random", "Off-topic and random chatter"),
-    ("help", "Help", "Questions and support"),
-]
-
 DEFAULTS = {
-    "federation_enabled": False,
+    # Federation is enabled by default so the community space (and other Matrix
+    # servers) are reachable out of the box.
+    "federation_enabled": True,
     "open_registration": True,
     "community_onboarded": False,
     "community_joined": False,
     # The alias of the space the "join the community" flow joins. Defaults to the
     # canonical OpenHost community space; can be overridden.
     "community_room_alias": DEFAULT_COMMUNITY_ROOM_ALIAS,
-    # Set once we've created the instance's own local space + default rooms.
-    "local_space_created": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -907,81 +897,6 @@ def _join_community_room(username: str, room_alias: str) -> str:
     return resp.get("room_id", "")
 
 
-def _create_local_space_with_rooms(username: str) -> None:
-    """Create a local space with a few default rooms on THIS homeserver, owned by
-    the onboarding user, so a fresh instance has ready-to-use rooms.
-
-    Idempotent-ish: guarded by the local_space_created setting so it runs once.
-    A space is a room created with creation_content type m.space; child rooms are
-    linked via m.space.child state on the space (and m.space.parent on the room
-    so clients show the hierarchy). All local, so no federation is required.
-    """
-    session = sso_login_for_owner(username)
-    token = session["access_token"]
-    server = session["home_server"]
-
-    def _create_room(body: dict) -> str:
-        resp = _synapse_request(
-            "POST", "/_matrix/client/v3/createRoom", token=token, body=body
-        )
-        return resp["room_id"]
-
-    # 1. Create the space (a room of type m.space).
-    space_id = _create_room(
-        {
-            "name": DEFAULT_LOCAL_SPACE_NAME,
-            "topic": "Rooms on this server",
-            "preset": "private_chat",
-            "creation_content": {"type": "m.space"},
-            "power_level_content_override": {"events_default": 0},
-        }
-    )
-
-    # 2. Create each default room and link it to the space.
-    via = [server]
-    for suffix, name, topic in DEFAULT_LOCAL_ROOMS:
-        room_id = _create_room(
-            {
-                "name": name,
-                "topic": topic,
-                "preset": "private_chat",
-                "room_alias_name": suffix,
-            }
-        )
-        # m.space.child on the space points at the room; m.space.parent on the
-        # room points back so clients render the hierarchy.
-        _synapse_request(
-            "PUT",
-            f"/_matrix/client/v3/rooms/{urllib.parse.quote(space_id, safe='')}"
-            f"/state/m.space.child/{urllib.parse.quote(room_id, safe='')}",
-            token=token,
-            body={"via": via, "suggested": True},
-        )
-        _synapse_request(
-            "PUT",
-            f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id, safe='')}"
-            f"/state/m.space.parent/{urllib.parse.quote(space_id, safe='')}",
-            token=token,
-            body={"via": via, "canonical": True},
-        )
-
-
-def _ensure_local_space(username: str) -> None:
-    """Create the instance's local space + default rooms once. Best-effort:
-    failures are logged but don't block onboarding (the owner can still chat)."""
-    settings = load_settings()
-    if settings.get("local_space_created"):
-        return
-    try:
-        _create_local_space_with_rooms(username)
-    except (SSOError, KeyError) as exc:
-        app.logger.error("could not create local space/rooms: %s", exc)
-        return
-    settings = load_settings()
-    settings["local_space_created"] = True
-    save_settings(settings)
-
-
 def _default_account_username() -> str:
     """Suggested default username for the first account, derived from the
     OpenHost owner's username (OPENHOST_OWNER_USERNAME) so onboarding pre-fills
@@ -1099,17 +1014,14 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       <p class="hint">You'll be signed in automatically. This password also works
          from other Matrix clients. Address: <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
 
-      <label class="consent">
-        <input type="checkbox" name="enable_federation" value="1" checked>
-        <span>Enable federation (connect to other Matrix servers).</span>
-      </label>
       {% if community_room_alias %}
       <label class="consent">
         <input type="checkbox" name="join_community" value="1" checked>
         <span>Join the OpenHost community space.</span>
       </label>
       {% endif %}
-      <p class="hint">Federation needs a publicly reachable instance.
+      <p class="hint">Federation is on by default so other Matrix servers are
+         reachable; you can turn it off later in the admin console.
          <a href="/_openhost/community/help" style="color:#a5b4fc">Details</a>.</p>
     </div>
 
@@ -1150,8 +1062,8 @@ HELP_TEMPLATE = """<!DOCTYPE html>
   <h2>Federation</h2>
   <ul>
     <li>Federation lets your server talk to other Matrix servers, including the
-        OpenHost community. It is optional and can be toggled anytime in the admin
-        console.</li>
+        OpenHost community. It is on by default and can be toggled anytime in the
+        admin console.</li>
     <li>Running a federated server may carry responsibilities (content, data, and
         legal considerations) that vary by jurisdiction.</li>
     <li>Federation needs a publicly reachable instance; it will not work on
@@ -1161,15 +1073,8 @@ HELP_TEMPLATE = """<!DOCTYPE html>
   <h2>OpenHost community space</h2>
   <p>Optionally join the shared OpenHost community space to chat with other
      OpenHost users. A space is a collection of rooms: joining it gives you the
-     space so you can browse and enter its rooms. This requires federation so
-     your server can reach the community's server. You can leave it off to keep
+     space so you can browse and enter its rooms. You can leave it off to keep
      your server fully private.</p>
-
-  <h2>Your rooms</h2>
-  <p>Setup also creates a local <strong>{{ local_space_name }}</strong> space on
-     your own server with a few starter rooms (General, Random, Help) so you have
-     somewhere to chat right away. You can rename, add, or remove rooms from the
-     chat client.</p>
 
   <a class="back" href="/_openhost/community/onboarding">&larr; Back to setup</a>
 </div></body></html>
@@ -1277,11 +1182,10 @@ def community_onboarding():
     # --- Finish onboarding: create the single owner account -------------------
     owner_username = (request.form.get("username") or "").strip().lower()
     owner_password = request.form.get("password") or ""
-    enable_federation = request.form.get("enable_federation") == "1"
     join_community = request.form.get("join_community") == "1"
-    # Joining the community room requires federation, so a join implies it.
-    if join_community:
-        enable_federation = True
+    # Federation is enabled by default (no onboarding checkbox); it can still be
+    # turned off later from the admin console.
+    enable_federation = True
 
     # Create the owner's Matrix account (single account). If the name is already
     # taken, we require the matching password (so re-running with the same
@@ -1318,40 +1222,32 @@ def community_onboarding():
     # rotating it, keeping the password working from other Matrix clients too.
     _store_owner_password(owner_username, owner_password)
 
-    # Give the fresh instance a local space with a few default rooms so the owner
-    # lands in a populated client instead of an empty one. Best-effort; local
-    # (no federation needed).
-    _ensure_local_space(owner_username)
-
     settings = load_settings()
     settings["community_username"] = owner_username
     settings["community_onboarded"] = True
-    # A community-room join is pending only if the owner opted in AND a room
-    # alias is configured. Joining a remote (federated) alias requires
-    # federation active in the running Synapse, which only takes effect after
-    # a restart, so the join is completed on the next boot by
-    # _complete_pending_community_join.
+    # A community join is pending only if the owner opted in AND a space/room
+    # alias is configured. Joining a remote (federated) alias requires federation
+    # active in the running Synapse, which only takes effect after a restart, so
+    # the join is completed on the next boot by _complete_pending_community_join.
     want_join = bool(join_community and room_alias)
     settings["federation_enabled"] = enable_federation
     settings["community_join_pending"] = want_join
     save_settings(settings)
 
-    # Applying federation requires patching homeserver.yaml + an app restart.
-    if enable_federation:
-        try:
-            apply_settings_to_yaml(settings)
-        except OSError as exc:
-            app.logger.error("could not apply federation setting: %s", exc)
-            return _render_onboarding(
-                server, room_alias,
-                error="Set up chat, but could not turn on federation. You can "
-                "retry from the admin console.",
-            )
-        # Federation activates on the automatic restart; any pending community
-        # join then completes in the background. This page polls and continues.
-        request_app_restart()
-        return render_template_string(JOIN_PENDING_TEMPLATE)
-    return redirect("/_openhost/community/login", code=302)
+    # Federation is applied by patching homeserver.yaml + an automatic app
+    # restart. It's on by default, so onboarding always restarts once here to
+    # activate it; any pending community join then completes in the background.
+    try:
+        apply_settings_to_yaml(settings)
+    except OSError as exc:
+        app.logger.error("could not apply federation setting: %s", exc)
+        return _render_onboarding(
+            server, room_alias,
+            error="Set up chat, but could not turn on federation. You can "
+            "retry from the admin console.",
+        )
+    request_app_restart()
+    return render_template_string(JOIN_PENDING_TEMPLATE)
 
 
 @app.route("/_openhost/community/help")
@@ -1362,9 +1258,7 @@ def community_help():
         server = _server_name()
     except SSOError:
         pass
-    return render_template_string(
-        HELP_TEMPLATE, server_name=server, local_space_name=DEFAULT_LOCAL_SPACE_NAME
-    )
+    return render_template_string(HELP_TEMPLATE, server_name=server)
 
 
 @app.route("/_openhost/community/login")

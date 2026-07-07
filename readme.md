@@ -1,7 +1,7 @@
 Matrix Synapse homeserver for OpenHost. Runs as a single Docker container:
 
 - Synapse latest (Matrix homeserver for end-to-end encrypted communication)
-- Federation disabled by default (personal/team server use case)
+- Federation enabled by default (so the community space and other Matrix servers are reachable)
 - Open registration enabled by default (no email verification required)
 - SQLite database (no external database required)
 - Persistent data in OpenHost's app_data directory
@@ -17,11 +17,10 @@ there is no toggle to enable it.
 
 - The OpenHost **owner is auto-logged-in** via SSO: opening the app with no
   existing session runs a short first-run **onboarding** flow. Onboarding is a
-  single account: you pick one username and password, and choose whether to
-  enable federation and join the OpenHost community space (both on by default).
-  Setup also creates a local space with a few starter rooms on your own server.
-  A separate help page explains the federation/legal/public-reachability
-  considerations.
+  single account: you pick one username and password, and choose whether to join
+  the OpenHost community space (on by default). Federation is enabled by default
+  (no onboarding toggle). A separate help page explains the federation/legal/
+  public-reachability considerations.
 - After onboarding, opening the app signs that account straight into the client.
 - The web client and onboarding are gated by OpenHost zone auth, so only the
   owner can reach them. The Matrix APIs (`/_matrix`, `.well-known`) stay public
@@ -116,14 +115,11 @@ Settings are stored in `$OPENHOST_APP_DATA_DIR/openhost_settings.json`:
 
 ## Federation
 
-Federation is **disabled** by default. The start script does two things to ensure this:
+Federation is **enabled** by default so the community space and other Matrix servers are reachable out of the box. When enabled, the `federation` listener name is present and there is no `federation_domain_whitelist` restriction.
 
-1. Removes `federation` from the Synapse listener names (only the `client` API is served on port 8008)
-2. Appends `federation_domain_whitelist: []` to `homeserver.yaml`, which blocks all server-to-server communication
+The Caddyfile serves `/.well-known/matrix/client` for client auto-discovery and `/.well-known/matrix/server` (pointing remote servers at port 443) so federation works over standard HTTPS without exposing port 8448.
 
-The Caddyfile serves `/.well-known/matrix/client` for client auto-discovery and `/.well-known/matrix/server` (pointing remote servers at port 443) so federation works over standard HTTPS without exposing port 8448. Federation is still blocked at the Synapse level until enabled.
-
-To enable federation, use the admin UI at `/_openhost/admin`. The app restarts itself automatically to apply the change.
+To disable federation (make it a fully private personal/team server), use the admin UI at `/_openhost/admin`. When disabled, `federation` is removed from the listener names and `federation_domain_whitelist: []` is appended to block all server-to-server communication. The app restarts itself automatically to apply the change.
 
 ## Registration
 
