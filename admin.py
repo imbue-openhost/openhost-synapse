@@ -1025,31 +1025,9 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   .row>div{flex:1;min-width:150px}
 </style></head>
 <body><div class="container">
-  <h1>Welcome to Community Chat</h1>
-  <p class="subtitle">A Matrix-based chat client, built in to your OpenHost instance.</p>
-
-  <div class="card">
-    <h2>What this does</h2>
-    <p>This runs a private Matrix homeserver on your instance and gives you a web
-       chat client. You can create as many accounts as you like below, each with
-       its own username and password: one for yourself and any for people you
-       want to invite. You'll be signed in automatically as the owner account.</p>
-  </div>
-
-  <div class="card">
-    <h2>Before you continue</h2>
-    <ul>
-      <li><strong>Federation is optional and off by default.</strong> Your server
-          only talks to other Matrix servers (including the OpenHost community) if
-          you enable federation later in the admin console.</li>
-      <li><strong>Running a federated server may carry responsibilities</strong>
-          (content, data, and legal considerations) that vary by jurisdiction.
-          Review these before enabling federation.</li>
-      <li><strong>Federation needs a publicly reachable instance.</strong> It will
-          not work on setups without public inbound HTTPS (e.g. some tunnel-only
-          configurations).</li>
-    </ul>
-  </div>
+  <h1>Set up chat</h1>
+  <p class="subtitle">Create your accounts, then open chat.
+     <a href="/_openhost/community/help" style="color:#a5b4fc">Learn more</a>.</p>
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
   {% if notice %}<div class="ok">{{ notice }}</div>{% endif %}
@@ -1059,11 +1037,19 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
     {% if accounts %}
     <div>
       {% for a in accounts %}
-      <div class="acct">@{{ a }}:{{ server_name }}</div>
+      <div class="acct">
+        <span>@{{ a }}:{{ server_name }}</span>
+        <form method="POST" action="/_openhost/community/onboarding" style="margin:0">
+          <input type="hidden" name="action" value="remove_account">
+          <input type="hidden" name="username" value="{{ a }}">
+          <button type="submit" title="Remove account"
+                  style="background:none;border:none;color:#f87171;cursor:pointer;font-size:1rem;padding:0 .25rem">&times;</button>
+        </form>
+      </div>
       {% endfor %}
     </div>
     {% else %}
-    <p class="hint" style="margin-bottom:1rem">No accounts yet. Create your first one below.</p>
+    <p class="hint" style="margin-bottom:1rem">Add one account for yourself, plus any for people you want to invite.</p>
     {% endif %}
     <form method="POST" action="/_openhost/community/onboarding">
       <input type="hidden" name="action" value="create_account">
@@ -1079,8 +1065,6 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
                  minlength="8" autocomplete="new-password" placeholder="min 8 characters">
         </div>
       </div>
-      <p class="hint">Lowercase letters, numbers, and . _ = - only. Matrix address:
-         <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
       <button type="submit" class="btn btn-secondary">Add account</button>
     </form>
   </div>
@@ -1088,11 +1072,8 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   <form method="POST" action="/_openhost/community/onboarding">
     <input type="hidden" name="action" value="finish">
     <div class="card">
-      <h2>Finish setup</h2>
-      <p>Pick which account signs you in automatically when you open the app, then
-         finish. You can add more accounts later from the admin console.</p>
       {% if accounts %}
-      <label for="owner_username" style="margin-top:1rem">Sign in as</label>
+      <label for="owner_username">Sign in as</label>
       <select id="owner_username" name="owner_username" required
               style="width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem">
         {% for a in accounts %}
@@ -1103,38 +1084,76 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       <label for="owner_password" style="margin-top:1rem">Password for that account</label>
       <input type="password" id="owner_password" name="owner_password" required
              autocomplete="current-password" placeholder="the password you set for it">
-      <p class="hint">We couldn't recover the password you set. Re-enter it for
-         the account you'll be auto-signed-in as.</p>
-      {% else %}
-      <p class="hint">You'll be auto-signed-in as this account using the password
-         you set for it.</p>
       {% endif %}
       {% else %}
-      <p class="hint">Create at least one account above before finishing.</p>
+      <p class="hint">Add at least one account above first.</p>
       {% endif %}
-      <label class="consent">
-        <input type="checkbox" name="consent" value="1" required>
-        <span>I understand what community chat does and the considerations above.</span>
-      </label>
-    </div>
 
-    {% if community_room_alias %}
-    <div class="card">
-      <h2>Join the OpenHost community?</h2>
-      <p>Optionally join the OpenHost community room
-         (<code>{{ community_room_alias }}</code>) to chat with other OpenHost
-         users. This <strong>enables federation</strong> so your server can reach
-         the community's server; review the considerations above first. You can
-         also do this later, or leave it off to keep your server fully private.</p>
       <label class="consent">
-        <input type="checkbox" name="join_community" value="1">
-        <span>Yes, enable federation and join the OpenHost community room.</span>
+        <input type="checkbox" name="enable_federation" value="1" checked>
+        <span>Enable federation (connect to other Matrix servers).</span>
       </label>
+      {% if community_room_alias %}
+      <label class="consent">
+        <input type="checkbox" name="join_community" value="1" checked>
+        <span>Join the OpenHost community room.</span>
+      </label>
+      {% endif %}
+      <p class="hint">Federation needs a publicly reachable instance.
+         <a href="/_openhost/community/help" style="color:#a5b4fc">Details</a>.</p>
     </div>
-    {% endif %}
 
     <button type="submit" class="btn"{% if not accounts %} disabled{% endif %}>Finish &amp; open chat</button>
   </form>
+</div></body></html>
+"""
+
+
+HELP_TEMPLATE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Community Chat: help</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
+  .container{max-width:640px;margin:0 auto}
+  h1{font-size:1.5rem;color:#f8fafc;margin-bottom:.25rem}
+  h2{font-size:1.05rem;color:#f1f5f9;margin:1.25rem 0 .4rem}
+  p,li{color:#cbd5e1;font-size:.92rem;line-height:1.55}
+  ul{margin:.4rem 0 0 1.1rem}
+  code{color:#a5b4fc}
+  a.back{display:inline-block;margin-top:1.5rem;color:#a5b4fc}
+</style></head>
+<body><div class="container">
+  <h1>Community Chat</h1>
+  <p>This runs a private Matrix homeserver on your instance with a built-in web
+     chat client. You sign in automatically as your owner account; other accounts
+     you create can sign in from this client or any Matrix app.</p>
+
+  <h2>Accounts</h2>
+  <p>Create as many accounts as you like, each with its own username and password:
+     one for yourself and any for people you want to invite. Usernames use
+     lowercase letters, numbers, and <code>. _ = -</code> only, giving Matrix
+     addresses like <code>@name:{{ server_name }}</code>. You can add or remove
+     accounts later from the admin console.</p>
+
+  <h2>Federation</h2>
+  <ul>
+    <li>Federation lets your server talk to other Matrix servers, including the
+        OpenHost community. It is optional and can be toggled anytime in the admin
+        console.</li>
+    <li>Running a federated server may carry responsibilities (content, data, and
+        legal considerations) that vary by jurisdiction.</li>
+    <li>Federation needs a publicly reachable instance; it will not work on
+        setups without public inbound HTTPS (e.g. some tunnel-only configs).</li>
+  </ul>
+
+  <h2>OpenHost community room</h2>
+  <p>Optionally join the shared OpenHost community room to chat with other
+     OpenHost users. This requires federation so your server can reach the
+     community's server. You can leave it off to keep your server fully private.</p>
+
+  <a class="back" href="/_openhost/community/onboarding">&larr; Back to setup</a>
 </div></body></html>
 """
 
@@ -1152,14 +1171,11 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
   a.btn{display:inline-block;margin-top:1rem;padding:.6rem 1rem;background:#6366f1;color:#fff;border-radius:.5rem;text-decoration:none}
 </style></head>
 <body><div class="container">
-  <h1>Community chat is enabled</h1>
+  <h1>Almost there</h1>
   <div class="card">
-    <p>You opted to join the OpenHost community room
-       (<code>{{ room_alias }}</code>). This turned on <strong>federation</strong>.</p>
-    <p>The app is <strong>restarting automatically</strong> to activate
-       federation. Once it comes back up, your server joins the community room
-       on its own in the background, no action needed.</p>
-    <p>This page will reconnect when the app is ready.</p>
+    <p>The app is <strong>restarting automatically</strong> to turn on
+       federation. This page reconnects and opens chat on its own when it's
+       ready, no action needed.</p>
     <a class="btn" href="/_openhost/community/login">Open chat</a>
   </div>
   <script>
@@ -1206,6 +1222,35 @@ def create_account(username: str, password: str, admin: bool = False) -> str | N
             return f"Username '{username}' is already taken."
         app.logger.error("create_account: registration failed: %s", exc)
         return "Could not create account. Check the app logs."
+    return None
+
+
+def delete_account(username: str) -> str | None:
+    """Deactivate a Matrix account (used to undo a mistyped account).
+
+    Returns None on success or a user-facing error string. Uses Synapse's admin
+    deactivate API; refuses to touch the SSO service account.
+    """
+    username = (username or "").strip().lower()
+    if not username or not _USERNAME_RE.match(username):
+        return "Invalid username."
+    if username == SSO_ADMIN_USER or username.startswith(SSO_ADMIN_USER + "-"):
+        return "That account can't be removed."
+    try:
+        admin_token = _get_admin_token()
+        server = _server_name()
+        user_id = f"@{username}:{server}"
+        # erase=True fully removes profile data; the account can be re-created
+        # with the same name afterward.
+        _synapse_request(
+            "POST",
+            f"/_synapse/admin/v1/deactivate/{urllib.parse.quote(user_id, safe='')}",
+            token=admin_token,
+            body={"erase": True},
+        )
+    except SSOError as exc:
+        app.logger.error("delete_account: deactivate failed: %s", exc)
+        return "Could not remove account. Check the app logs."
     return None
 
 
@@ -1267,11 +1312,25 @@ def community_onboarding():
             notice=f"Created @{username}. Add more, or finish below.",
         )
 
+    # --- Remove an account (fix a typo'd account) -----------------------------
+    if action == "remove_account":
+        username = (request.form.get("username") or "").strip().lower()
+        error = delete_account(username)
+        # Forget any remembered onboarding password for it.
+        with _onboarding_lock:
+            _onboarding_passwords.pop(username, None)
+        if error:
+            return _render_onboarding(server, room_alias, error=error)
+        return _render_onboarding(server, room_alias, notice=f"Removed @{username}.")
+
     # --- Finish onboarding ----------------------------------------------------
     if action == "finish":
-        consent = request.form.get("consent") == "1"
         owner_username = (request.form.get("owner_username") or "").strip().lower()
+        enable_federation = request.form.get("enable_federation") == "1"
         join_community = request.form.get("join_community") == "1"
+        # Joining the community room requires federation, so a join implies it.
+        if join_community:
+            enable_federation = True
 
         try:
             accounts = list_user_localparts()
@@ -1280,11 +1339,6 @@ def community_onboarding():
         if not accounts:
             return _render_onboarding(
                 server, room_alias, error="Create at least one account before finishing.",
-            )
-        if not consent:
-            return _render_onboarding(
-                server, room_alias, suggested=owner_username,
-                error="Please confirm you understand before finishing.",
             )
         # The chosen owner account must be one we actually created.
         if owner_username not in accounts:
@@ -1332,37 +1386,45 @@ def community_onboarding():
 
         settings["community_username"] = owner_username
         settings["community_onboarded"] = True
+        # A community-room join is pending only if the owner opted in AND a room
+        # alias is configured. Joining a remote (federated) alias requires
+        # federation active in the running Synapse, which only takes effect after
+        # a restart, so the join is completed on the next boot by
+        # _complete_pending_community_join.
+        want_join = bool(join_community and room_alias)
+        settings["federation_enabled"] = enable_federation
+        settings["community_join_pending"] = want_join
         save_settings(settings)
 
-        # Explicit, opt-in community join: only if the owner ticked the box AND a
-        # room alias is configured. Never automatic.
-        #
-        # Joining a *remote* (federated) room alias requires federation to be
-        # enabled AND active in the running Synapse. Enabling federation only
-        # takes effect after a restart, so we record the intent + turn federation
-        # on, trigger an automatic app restart, and the join completes on the next
-        # boot via _complete_pending_community_join.
-        if join_community and room_alias:
-            settings = load_settings()
-            settings["federation_enabled"] = True
-            settings["community_join_pending"] = True
-            save_settings(settings)
+        # Applying federation requires patching homeserver.yaml + an app restart.
+        if enable_federation:
             try:
                 apply_settings_to_yaml(settings)
             except OSError as exc:
                 app.logger.error("could not apply federation setting: %s", exc)
                 return _render_onboarding(
                     server, room_alias,
-                    error="Enabled chat, but could not turn on federation to join the "
-                    "community. You can retry from the admin console.",
+                    error="Set up chat, but could not turn on federation. You can "
+                    "retry from the admin console.",
                 )
-            # Federation activates on the automatic restart; the join then
-            # completes in the background. This page polls and continues.
+            # Federation activates on the automatic restart; any pending community
+            # join then completes in the background. This page polls and continues.
             request_app_restart()
-            return render_template_string(JOIN_PENDING_TEMPLATE, room_alias=room_alias)
+            return render_template_string(JOIN_PENDING_TEMPLATE)
         return redirect("/_openhost/community/login", code=302)
 
     return _render_onboarding(server, room_alias)
+
+
+@app.route("/_openhost/community/help")
+def community_help():
+    """Detailed help for the onboarding flow. Owner-only (zone_auth gated)."""
+    server = ""
+    try:
+        server = _server_name()
+    except SSOError:
+        pass
+    return render_template_string(HELP_TEMPLATE, server_name=server)
 
 
 @app.route("/_openhost/community/login")
