@@ -902,7 +902,7 @@ def save():
     elif not needs_restart:
         message = "Settings saved."
     elif restarted:
-        message = "Settings saved. The app is restarting to apply changes — this page will be available again in a moment."
+        message = "Settings saved. The app is restarting to apply changes; this page will be available again in a moment."
     else:
         warning = (
             "Settings saved, but the app could not be restarted automatically. "
@@ -934,17 +934,47 @@ def _owner_matrix_username() -> str:
 
 
 SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Signing in…</title></head>
+<html lang="en"><head><meta charset="UTF-8"><title>Signing in...</title></head>
 <body style="background:#0f1117;color:#e2e8f0;font-family:sans-serif;text-align:center;padding-top:20vh">
-<p>Signing you in to community chat…</p>
+<p id="msg">Signing you in to community chat...</p>
 <script>
-try {
-  localStorage.setItem("cinny_access_token", {{ access_token|tojson }});
-  localStorage.setItem("cinny_device_id", {{ device_id|tojson }});
-  localStorage.setItem("cinny_user_id", {{ user_id|tojson }});
-  localStorage.setItem("cinny_hs_base_url", {{ hs_base_url|tojson }});
-} catch (e) {}
-window.location.replace("/");
+(function () {
+  var token = {{ access_token|tojson }};
+  var deviceId = {{ device_id|tojson }};
+  var userId = {{ user_id|tojson }};
+  var hsBase = {{ hs_base_url|tojson }};
+
+  try {
+    localStorage.setItem("cinny_access_token", token);
+    localStorage.setItem("cinny_device_id", deviceId);
+    localStorage.setItem("cinny_user_id", userId);
+    localStorage.setItem("cinny_hs_base_url", hsBase);
+  } catch (e) {}
+
+  // The access token/device was just minted server-side. Loading the client
+  // immediately can race that write becoming usable (the client would then show
+  // a transient "can't sign in yet" screen). Confirm the session is live by
+  // polling /whoami with the token, and only then hand off to the client. Retry
+  // for a few seconds; fall back to loading anyway so we never get stuck here.
+  var attempts = 0;
+  var maxAttempts = 20;   // ~10s at 500ms
+  function go() { window.location.replace("/"); }
+  function check() {
+    attempts++;
+    fetch(hsBase + "/_matrix/client/v3/account/whoami", {
+      headers: { Authorization: "Bearer " + token },
+      cache: "no-store"
+    }).then(function (r) {
+      if (r.ok) { go(); }
+      else if (attempts < maxAttempts) { setTimeout(check, 500); }
+      else { go(); }
+    }).catch(function () {
+      if (attempts < maxAttempts) { setTimeout(check, 500); }
+      else { go(); }
+    });
+  }
+  check();
+})();
 </script>
 </body></html>
 """
@@ -988,7 +1018,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
     <h2>What this does</h2>
     <p>This runs a private Matrix homeserver on your instance and gives you a web
        chat client. You can create as many accounts as you like below, each with
-       its own username and password — one for yourself and any for people you
+       its own username and password: one for yourself and any for people you
        want to invite. You'll be signed in automatically as the owner account.</p>
   </div>
 
@@ -1059,7 +1089,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       <label for="owner_password" style="margin-top:1rem">Password for that account</label>
       <input type="password" id="owner_password" name="owner_password" required
              autocomplete="current-password" placeholder="the password you set for it">
-      <p class="hint">We couldn't recover the password you set — re-enter it for
+      <p class="hint">We couldn't recover the password you set. Re-enter it for
          the account you'll be auto-signed-in as.</p>
       {% else %}
       <p class="hint">You'll be auto-signed-in as this account using the password
@@ -1080,7 +1110,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       <p>Optionally join the OpenHost community room
          (<code>{{ community_room_alias }}</code>) to chat with other OpenHost
          users. This <strong>enables federation</strong> so your server can reach
-         the community's server — review the considerations above first. You can
+         the community's server; review the considerations above first. You can
          also do this later, or leave it off to keep your server fully private.</p>
       <label class="consent">
         <input type="checkbox" name="join_community" value="1">
@@ -1114,7 +1144,7 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
        (<code>{{ room_alias }}</code>). This turned on <strong>federation</strong>.</p>
     <p>The app is <strong>restarting automatically</strong> to activate
        federation. Once it comes back up, your server joins the community room
-       on its own in the background — no action needed.</p>
+       on its own in the background, no action needed.</p>
     <p>This page will reconnect when the app is ready.</p>
     <a class="btn" href="/_openhost/community/login">Open chat</a>
   </div>
