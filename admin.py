@@ -5,9 +5,13 @@ OpenHost Synapse Admin UI
 Serves a simple web interface at /_openhost/admin for managing:
   - Federation (enable/disable)
   - Open registration (enable/disable)
+  - Chat accounts (create as many as you like, with chosen usernames/passwords)
 
 Settings are persisted to openhost_settings.json in the Synapse data dir.
-On change, homeserver.yaml is patched and Synapse is sent SIGHUP to reload.
+On change, homeserver.yaml is patched and the app restarts itself automatically
+(no manual restart): we write a restart sentinel and stop Synapse, and the
+supervisor in start.sh exits so podman's --restart=unless-stopped policy
+relaunches the container with the new config.
 """
 
 import hashlib
@@ -17,8 +21,10 @@ import os
 import re
 import secrets
 import signal
+import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -29,6 +35,13 @@ app = Flask(__name__)
 DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data"))
 SETTINGS_FILE = DATA_DIR / "openhost_settings.json"
 HOMESERVER_YAML = DATA_DIR / "homeserver.yaml"
+# Path of the restart sentinel that start.sh watches. When we want the app to
+# restart (to apply settings), we touch this file and then stop Synapse; the
+# supervisor exits and podman relaunches the container. Kept in sync with
+# start.sh's RESTART_SENTINEL via this env var.
+RESTART_SENTINEL = Path(
+    os.environ.get("OPENHOST_RESTART_SENTINEL", str(DATA_DIR / ".openhost_restart_requested"))
+)
 
 # Synapse listens on localhost:8008 inside the container. The admin/SSO code
 # talks to it directly here, bypassing the OpenHost router + zone_auth (which
@@ -50,7 +63,6 @@ DEFAULT_COMMUNITY_ROOM_ALIAS = "#openhost-community-general:matrix.openhost.imbu
 DEFAULTS = {
     "federation_enabled": False,
     "open_registration": True,
-    "community_enabled": False,
     "community_onboarded": False,
     "community_joined": False,
     # The single string defining which room the "join the community" flow joins.
@@ -95,15 +107,49 @@ def _set_yaml_bool(content: str, key: str, value: bool) -> str:
 def _patch_federation_listener(content: str, enabled: bool) -> str:
     """
     Add or remove 'federation' from the Synapse listener names list.
-    Handles the inline-list format: names: [client] / names: [client, federation]
-    """
-    def replace_names(m: re.Match) -> str:
-        prefix = m.group(1)
-        return prefix + "[client, federation]" if enabled else prefix + "[client]"
 
-    # Match: (optional dash + spaces) names: [(client)(, federation)?]
-    pattern = r"((?:-\s+)?names:\s*\[)client(?:,\s*federation)?\]"
-    new = re.sub(pattern, replace_names, content)
+    Synapse's generated config uses a multi-line block-list format:
+
+        names:
+        - client
+        - federation
+
+    but an inline list (``names: [client]``) is also valid YAML. Handle both so
+    the listener genuinely reflects the federation setting (leaving 'federation'
+    in the listener when disabled is inconsistent even though the domain
+    whitelist still blocks it).
+    """
+    # --- Inline list: names: [client] / [client, federation] ------------------
+    inline = r"((?:-\s+)?names:\s*\[)\s*client\s*(?:,\s*federation\s*)?\]"
+    if re.search(inline, content):
+        repl = (lambda m: m.group(1) + ("client, federation]" if enabled else "client]"))
+        return re.sub(inline, repl, content)
+
+    # --- Multi-line block list ------------------------------------------------
+    # Find a `names:` key followed by `- <name>` items and rewrite that block.
+    def replace_block(m: re.Match) -> str:
+        header = m.group("header")  # the `names:` line (with indentation)
+        indent = m.group("indent")  # indentation of the `names:` key
+        items_text = m.group("items")
+        # Preserve the item indentation from the first item line.
+        first = re.search(r"^(\s*)-\s*", items_text, flags=re.MULTILINE)
+        item_indent = first.group(1) if first else indent + "  "
+        names = re.findall(r"^\s*-\s*(\S+)\s*$", items_text, flags=re.MULTILINE)
+        names = [n for n in names if n not in ("client", "federation")]
+        rebuilt = ["client"] + (["federation"] if enabled else []) + names
+        # de-dupe while preserving order
+        seen: list[str] = []
+        for n in rebuilt:
+            if n not in seen:
+                seen.append(n)
+        lines = "".join(f"{item_indent}- {n}\n" for n in seen)
+        return f"{header}\n{lines}".rstrip("\n") + "\n"
+
+    block = re.compile(
+        r"(?P<header>(?P<indent>[ \t]*)names:)[ \t]*\n"
+        r"(?P<items>(?:[ \t]*-[ \t]*\S+[ \t]*\n)+)",
+    )
+    new = block.sub(replace_block, content, count=1)
     return new
 
 
@@ -175,24 +221,52 @@ def _find_synapse_pids() -> list[int]:
             except (OSError, ValueError):
                 continue
     except OSError as exc:
-        app.logger.error("reload_synapse: could not scan /proc: %s", exc)
+        app.logger.error("_find_synapse_pids: could not scan /proc: %s", exc)
     return pids
 
 
-def reload_synapse() -> bool:
-    """Send SIGHUP to Synapse so it reloads config. Returns True on success."""
+def request_app_restart() -> bool:
+    """Restart the whole app so config changes take effect — no manual step.
+
+    Synapse only reads registration/federation settings at startup (SIGHUP only
+    reloads log config), so applying these reliably requires a real restart.
+
+    Mechanism: write the restart sentinel that start.sh watches, then stop
+    Synapse (SIGTERM). start.sh runs Synapse as a supervised child; when it
+    exits, start.sh (PID 1) exits too, and podman's --restart=unless-stopped
+    policy relaunches the container, which re-renders config from the saved
+    settings on boot.
+
+    Returns True if the restart was successfully initiated. We stop Synapse in a
+    background thread after a short delay so the HTTP response reaches the
+    browser first (the client polls / auto-reloads afterwards).
+    """
     try:
-        pids = _find_synapse_pids()
-        if not pids:
-            app.logger.warning("reload_synapse: no Synapse processes found")
-            return False
-        for pid in pids:
-            os.kill(pid, signal.SIGHUP)
-        app.logger.info("reload_synapse: sent SIGHUP to pids %s", pids)
-        return True
-    except (ValueError, ProcessLookupError, PermissionError) as exc:
-        app.logger.error("reload_synapse: failed to reload Synapse: %s", exc)
+        RESTART_SENTINEL.write_text("restart requested by admin UI\n")
+    except OSError as exc:
+        app.logger.error("request_app_restart: could not write sentinel: %s", exc)
         return False
+
+    pids = _find_synapse_pids()
+    if not pids:
+        # No Synapse yet (e.g. still starting). The sentinel is set; leave it —
+        # but we can't force a restart, so report failure so the UI can advise.
+        app.logger.warning("request_app_restart: no Synapse processes found")
+        return False
+
+    def _do_restart() -> None:
+        import time
+
+        time.sleep(1.5)  # let the HTTP response flush to the browser
+        for pid in _find_synapse_pids():
+            try:
+                os.kill(pid, signal.SIGTERM)
+                app.logger.info("request_app_restart: sent SIGTERM to pid %s", pid)
+            except (ProcessLookupError, PermissionError) as exc:
+                app.logger.error("request_app_restart: kill pid %s failed: %s", pid, exc)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +399,7 @@ TEMPLATE = """<!DOCTYPE html>
 <body>
   <div class="container">
     <h1>Synapse Admin</h1>
-    <p class="subtitle">Manage federation and registration settings for this Matrix server.</p>
+    <p class="subtitle">Manage the chat account, federation and registration for this Matrix server.</p>
 
     {% if message %}
       <div class="alert alert-success">{{ message }}</div>
@@ -333,6 +407,34 @@ TEMPLATE = """<!DOCTYPE html>
     {% if warning %}
       <div class="alert alert-warning">{{ warning }}</div>
     {% endif %}
+
+    <div class="card">
+      <div class="setting-info" style="margin-bottom:1rem">
+        <h2>Chat account</h2>
+        <p>Your account is signed in automatically in the built-in web client.
+           The password below also works from any third-party Matrix client.</p>
+      </div>
+      {% if owner_username %}
+      <div style="padding:.5rem .75rem;background:#0d1117;border:1px solid #2d3348;border-radius:.4rem;margin-bottom:1rem;font-family:monospace;color:#a5b4fc">
+        @{{ owner_username }}:{{ server_name }}
+      </div>
+      <form method="POST" action="/_openhost/admin/accounts/password"
+            style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end">
+        <div style="flex:1;min-width:180px">
+          <label for="new_password" style="display:block;font-size:.8rem;color:#94a3b8;margin-bottom:.3rem">Change password</label>
+          <input type="password" id="new_password" name="password" required
+            minlength="8" autocomplete="new-password"
+            placeholder="at least 8 characters"
+            style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
+        </div>
+        <button type="submit" class="save-btn" style="margin-top:0;width:auto;padding:.55rem 1.25rem">Update</button>
+      </form>
+      <p style="font-size:.75rem;color:#64748b;margin-top:.75rem">
+        Changing the password does not restart the app.</p>
+      {% else %}
+      <p style="font-size:.8rem;color:#64748b">No account set up yet. Open the app to finish setup.</p>
+      {% endif %}
+    </div>
 
     <form method="POST" action="/_openhost/admin/save">
       <div class="card">
@@ -361,21 +463,6 @@ TEMPLATE = """<!DOCTYPE html>
             <span class="slider"></span>
           </label>
         </div>
-      </div>
-
-      <div class="card">
-        <div class="setting-row">
-          <div class="setting-info">
-            <h2>Community Chat</h2>
-            <p>Serve the built-in web chat client at this app's URL and enable the
-               OpenHost community first-run flow. Requires an app restart to apply.</p>
-          </div>
-          <label class="toggle-label">
-            <input type="checkbox" name="community_enabled" value="1"
-              {% if settings.community_enabled %}checked{% endif %}>
-            <span class="slider"></span>
-          </label>
-        </div>
         <div style="margin-top:1rem">
           <label for="community_room_alias" style="display:block;font-size:.85rem;color:#94a3b8;margin-bottom:.35rem">
             Community room alias (optional)</label>
@@ -390,6 +477,9 @@ TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <button type="submit" class="save-btn">Save &amp; Apply</button>
+      <p style="font-size:.75rem;color:#64748b;margin-top:.75rem;text-align:center">
+        Saving federation or registration changes restarts the app automatically
+        to apply them.</p>
     </form>
   </div>
 </body>
@@ -561,6 +651,39 @@ def _read_server_name_from_yaml() -> str:
     raise SSOError("could not determine server_name")
 
 
+def list_user_localparts() -> list[str]:
+    """Return the localparts of human accounts on this homeserver.
+
+    Excludes the SSO service account(s) we create for owner auto-login and any
+    deactivated users. Uses Synapse's admin user-list API (paginated).
+    """
+    token = _get_admin_token()
+    server = _server_name()
+    localparts: list[str] = []
+    next_token: str | None = None
+    for _ in range(100):  # hard cap on pages to avoid an unbounded loop
+        path = "/_synapse/admin/v2/users?deactivated=false&limit=100"
+        if next_token is not None:
+            path += f"&from={urllib.parse.quote(str(next_token))}"
+        resp = _synapse_request("GET", path, token=token)
+        for u in resp.get("users", []):
+            name = u.get("name", "")  # full @user:server
+            if u.get("deactivated"):
+                continue
+            m = re.match(r"^@([^:]+):(.+)$", name)
+            if not m or m.group(2) != server:
+                continue
+            localpart = m.group(1)
+            # Hide the SSO service accounts (named openhost-sso-admin[-xxxx]).
+            if localpart == SSO_ADMIN_USER or localpart.startswith(SSO_ADMIN_USER + "-"):
+                continue
+            localparts.append(localpart)
+        next_token = resp.get("next_token")
+        if next_token is None:
+            break
+    return sorted(localparts)
+
+
 # Serialize SSO logins: the flow sets a fresh ephemeral password then logs in
 # with it, so two concurrent logins for the same owner could otherwise race
 # (one overwrites the other's password before it logs in). Logins are rare and
@@ -568,14 +691,40 @@ def _read_server_name_from_yaml() -> str:
 _sso_lock = threading.Lock()
 
 
+def _store_owner_password(username: str, password: str) -> None:
+    """Persist the owner account's password in the 0600 SSO state file so SSO can
+    log in as them WITHOUT rotating (overwriting) the password they chose.
+
+    This is what lets the owner keep using the username/password they set during
+    onboarding from other clients (e.g. a phone) — SSO reuses that exact password
+    rather than replacing it with a random one on every auto-login.
+    """
+    state = _load_sso_state()
+    owners = state.get("owner_passwords") or {}
+    owners[username] = password
+    state["owner_passwords"] = owners
+    _save_sso_state(state)
+
+
+def _get_stored_owner_password(username: str) -> str | None:
+    state = _load_sso_state()
+    return (state.get("owner_passwords") or {}).get(username)
+
+
 def sso_login_for_owner(username: str) -> dict:
     """Ensure the owner's Matrix user exists and mint a fresh session for it.
 
-    We set the owner's password via the admin API, then perform a *normal*
-    client login (m.login.password). Unlike the admin login endpoint, this
-    creates a real device and returns a device_id — which the web client
-    (matrix-js-sdk) requires to initialise a session; a session with an empty
-    device_id is rejected and the client bounces to its own login screen.
+    We perform a *normal* client login (m.login.password), which — unlike the
+    admin login endpoint — creates a real device and returns a device_id, which
+    the web client (matrix-js-sdk) requires to initialise a session; a session
+    with an empty device_id is rejected and the client bounces to its own login
+    screen.
+
+    Preferred path: log in with the owner's stored password (chosen during
+    onboarding), so their password is never rotated and keeps working from other
+    clients. Only if no stored password exists (older instances that predate this
+    behaviour) do we fall back to setting a fresh ephemeral password via the admin
+    API — and we persist that so subsequent logins stop rotating too.
 
     Serialized under _sso_lock so concurrent logins can't race on the password.
 
@@ -586,21 +735,26 @@ def sso_login_for_owner(username: str) -> dict:
 
 
 def _sso_login_for_owner_locked(username: str) -> dict:
-    admin_token = _get_admin_token()
     server = _server_name()
     user_id = f"@{username}:{server}"
 
-    # Set a fresh, ephemeral password for this login. Idempotent create-or-update.
-    password = _generate_password()
-    _synapse_request(
-        "PUT",
-        f"/_synapse/admin/v2/users/{user_id}",
-        token=admin_token,
-        # logout_devices=False so re-running SSO doesn't kill the owner's other
-        # existing chat sessions (e.g. a mobile client) via the password change.
-        body={"password": password, "logout_devices": False},
-    )
-    # Normal client login -> real device_id + access_token.
+    password = _get_stored_owner_password(username)
+    if not password:
+        # Backward-compat: no stored password (e.g. instance onboarded before this
+        # change, or SSO state lost). Set one via the admin API and persist it so
+        # future logins reuse it instead of rotating. logout_devices=False so we
+        # don't kill the owner's existing sessions.
+        admin_token = _get_admin_token()
+        password = _generate_password()
+        _synapse_request(
+            "PUT",
+            f"/_synapse/admin/v2/users/{user_id}",
+            token=admin_token,
+            body={"password": password, "logout_devices": False},
+        )
+        _store_owner_password(username, password)
+
+    # Normal client login -> real device_id + access_token. No password change.
     login = _synapse_request(
         "POST",
         "/_matrix/client/v3/login",
@@ -623,10 +777,55 @@ def _sso_login_for_owner_locked(username: str) -> dict:
 # Routes
 # ---------------------------------------------------------------------------
 
+def _render_index(message=None, warning=None):
+    settings = load_settings()
+    server = ""
+    try:
+        server = _server_name()
+    except SSOError:
+        pass
+    # Only show the account card once onboarding has set the owner account;
+    # community_username is empty until then.
+    return render_template_string(
+        TEMPLATE,
+        settings=settings,
+        server_name=server,
+        owner_username=settings.get("community_username") or "",
+        message=message,
+        warning=warning,
+    )
+
+
 @app.route("/_openhost/admin")
 def index():
-    settings = load_settings()
-    return render_template_string(TEMPLATE, settings=settings, message=None, warning=None)
+    return _render_index()
+
+
+@app.route("/_openhost/admin/accounts/password", methods=["POST"])
+def accounts_password():
+    """Change the owner account's password. Updates it in Synapse and in the
+    stored SSO password so auto-login keeps working. Does not restart the app."""
+    password = request.form.get("password") or ""
+    if len(password) < _MIN_PASSWORD_LEN:
+        return _render_index(warning=f"Password must be at least {_MIN_PASSWORD_LEN} characters.")
+    username = _owner_matrix_username()
+    try:
+        admin_token = _get_admin_token()
+        server = _server_name()
+        user_id = f"@{username}:{server}"
+        # logout_devices=False so changing the password doesn't kill existing
+        # chat sessions (e.g. a mobile client).
+        _synapse_request(
+            "PUT",
+            f"/_synapse/admin/v2/users/{urllib.parse.quote(user_id, safe='')}",
+            token=admin_token,
+            body={"password": password, "logout_devices": False},
+        )
+    except SSOError as exc:
+        app.logger.error("accounts_password: could not set password: %s", exc)
+        return _render_index(warning="Could not update password. Check the app logs.")
+    _store_owner_password(username, password)
+    return _render_index(message=f"Password updated for @{username}.")
 
 
 @app.route("/_openhost/admin/save", methods=["POST"])
@@ -634,9 +833,9 @@ def save():
     # Merge onto existing settings so flags not shown on this form (e.g.
     # community_onboarded, set by the onboarding flow) are preserved.
     settings = load_settings()
+    prev = load_settings()
     settings["federation_enabled"] = request.form.get("federation_enabled") == "1"
     settings["open_registration"] = request.form.get("open_registration") == "1"
-    settings["community_enabled"] = request.form.get("community_enabled") == "1"
     if "community_room_alias" in request.form:
         settings["community_room_alias"] = request.form.get("community_room_alias", "").strip()
     save_settings(settings)
@@ -650,23 +849,32 @@ def save():
     except OSError as exc:
         yaml_error = str(exc)
 
-    reloaded = False if yaml_error else reload_synapse()
+    # Only restart when a setting that requires a Synapse restart actually
+    # changed (federation or registration). A no-op save shouldn't bounce the app.
+    needs_restart = (
+        settings["federation_enabled"] != prev["federation_enabled"]
+        or settings["open_registration"] != prev["open_registration"]
+    )
+
+    restarted = False
+    if not yaml_error and needs_restart:
+        restarted = request_app_restart()
 
     warning = None
+    message = None
     if yaml_error:
         warning = f"Settings saved, but could not update homeserver.yaml: {yaml_error}"
-    elif not reloaded:
+    elif not needs_restart:
+        message = "Settings saved."
+    elif restarted:
+        message = "Settings saved. The app is restarting to apply changes; this page will be available again in a moment."
+    else:
         warning = (
-            "Settings saved, but Synapse could not be reloaded automatically. "
-            "Restart the app to apply changes."
+            "Settings saved, but the app could not be restarted automatically. "
+            "Restart the app from your OpenHost dashboard to apply changes."
         )
 
-    return render_template_string(
-        TEMPLATE,
-        settings=settings,
-        message="Settings saved. Restart the app to apply changes." if reloaded else None,
-        warning=warning,
-    )
+    return _render_index(message=message, warning=warning)
 
 
 def _join_community_room(username: str, room_alias: str) -> str:
@@ -678,32 +886,74 @@ def _join_community_room(username: str, room_alias: str) -> str:
     token = session["access_token"]
     # POST /join/{roomIdOrAlias} resolves the alias (over federation if remote)
     # and joins. Idempotent: joining an already-joined room returns the room_id.
-    import urllib.parse
-
     quoted = urllib.parse.quote(room_alias, safe="")
     resp = _synapse_request("POST", f"/_matrix/client/v3/join/{quoted}", token=token, body={})
     return resp.get("room_id", "")
 
 
+def _default_account_username() -> str:
+    """Suggested default username for the first account, derived from the
+    OpenHost owner's username (OPENHOST_OWNER_USERNAME) so onboarding pre-fills
+    the operator's own name instead of a generic "owner".
+
+    Matrix localparts are restricted (lowercase letters, digits, and . _ = -),
+    so we lowercase and strip anything else. If the result is empty (or the env
+    var is unset), fall back to the stable "owner" default.
+    """
+    raw = os.environ.get("OPENHOST_OWNER_USERNAME", "") or ""
+    sanitized = re.sub(r"[^a-z0-9._=-]", "", raw.strip().lower())
+    return sanitized or "owner"
+
+
 def _owner_matrix_username() -> str:
     """The Matrix localpart for the OpenHost owner. Configurable via onboarding;
-    falls back to a stable default."""
+    falls back to the OpenHost owner username (or a stable default)."""
     settings = load_settings()
-    return settings.get("community_username") or "owner"
+    return settings.get("community_username") or _default_account_username()
 
 
 SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Signing in…</title></head>
+<html lang="en"><head><meta charset="UTF-8"><title>Signing in...</title></head>
 <body style="background:#0f1117;color:#e2e8f0;font-family:sans-serif;text-align:center;padding-top:20vh">
-<p>Signing you in to community chat…</p>
+<p id="msg">Signing you in to community chat...</p>
 <script>
-try {
-  localStorage.setItem("cinny_access_token", {{ access_token|tojson }});
-  localStorage.setItem("cinny_device_id", {{ device_id|tojson }});
-  localStorage.setItem("cinny_user_id", {{ user_id|tojson }});
-  localStorage.setItem("cinny_hs_base_url", {{ hs_base_url|tojson }});
-} catch (e) {}
-window.location.replace("/");
+(function () {
+  var token = {{ access_token|tojson }};
+  var deviceId = {{ device_id|tojson }};
+  var userId = {{ user_id|tojson }};
+  var hsBase = {{ hs_base_url|tojson }};
+
+  try {
+    localStorage.setItem("cinny_access_token", token);
+    localStorage.setItem("cinny_device_id", deviceId);
+    localStorage.setItem("cinny_user_id", userId);
+    localStorage.setItem("cinny_hs_base_url", hsBase);
+  } catch (e) {}
+
+  // The access token/device was just minted server-side. Loading the client
+  // immediately can race that write becoming usable (the client would then show
+  // a transient "can't sign in yet" screen). Confirm the session is live by
+  // polling /whoami with the token, and only then hand off to the client. Retry
+  // for a few seconds; fall back to loading anyway so we never get stuck here.
+  var attempts = 0;
+  var maxAttempts = 20;   // ~10s at 500ms
+  function go() { window.location.replace("/"); }
+  function check() {
+    attempts++;
+    fetch(hsBase + "/_matrix/client/v3/account/whoami", {
+      headers: { Authorization: "Bearer " + token },
+      cache: "no-store"
+    }).then(function (r) {
+      if (r.ok) { go(); }
+      else if (attempts < maxAttempts) { setTimeout(check, 500); }
+      else { go(); }
+    }).catch(function () {
+      if (attempts < maxAttempts) { setTimeout(check, 500); }
+      else { go(); }
+    });
+  }
+  check();
+})();
 </script>
 </body></html>
 """
@@ -712,7 +962,7 @@ window.location.replace("/");
 ONBOARDING_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Set up Community Chat</title>
+<title>Set up chat</title>
 <style>
   *,*::before,*::after{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
@@ -722,77 +972,107 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   .card{background:#1e2130;border:1px solid #2d3348;border-radius:.75rem;padding:1.5rem;margin-bottom:1rem}
   .card h2{font-size:1.05rem;color:#f1f5f9;margin:0 0 .5rem}
   .card p,li{color:#cbd5e1;font-size:.9rem;line-height:1.5}
-  ul{margin:.5rem 0 0 1.1rem}
   label{display:block;font-size:.9rem;color:#f1f5f9;margin-bottom:.35rem}
-  input[type=text]{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem}
+  input[type=text],input[type=password]{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0;font-size:.95rem}
   .hint{color:#64748b;font-size:.8rem;margin-top:.35rem}
   .consent{display:flex;gap:.6rem;align-items:flex-start;margin-top:1rem}
   .consent input{margin-top:.2rem}
   .btn{display:block;width:100%;padding:.75rem;background:#6366f1;color:#fff;border:none;border-radius:.5rem;font-size:.95rem;font-weight:500;cursor:pointer;margin-top:1.25rem}
   .btn:hover{background:#4f46e5}
-  .warn{background:#1c1003;border:1px solid #92400e;color:#fbbf24;border-radius:.5rem;padding:.75rem 1rem;font-size:.85rem;margin-bottom:1rem}
   .err{color:#f87171;font-size:.85rem;margin-top:.5rem}
+  .row{display:flex;gap:.75rem;flex-wrap:wrap}
+  .row>div{flex:1;min-width:150px}
 </style></head>
 <body><div class="container">
-  <h1>Welcome to Community Chat</h1>
-  <p class="subtitle">A Matrix-based chat client, built in to your OpenHost instance.</p>
-
-  <div class="card">
-    <h2>What this does</h2>
-    <p>This runs a private Matrix homeserver on your instance and gives you a web
-       chat client, signed in automatically as the instance owner. You can chat
-       privately, invite others, and — if you opt in — join the wider OpenHost
-       community room.</p>
-  </div>
-
-  <div class="card">
-    <h2>Before you continue</h2>
-    <ul>
-      <li><strong>Federation is optional and off by default.</strong> Your server
-          only talks to other Matrix servers (including the OpenHost community) if
-          you enable federation later in the admin console.</li>
-      <li><strong>Running a federated server may carry responsibilities</strong>
-          (content, data, and legal considerations) that vary by jurisdiction.
-          Review these before enabling federation.</li>
-      <li><strong>Federation needs a publicly reachable instance.</strong> It will
-          not work on setups without public inbound HTTPS (e.g. some tunnel-only
-          configurations).</li>
-    </ul>
-  </div>
+  <h1>Set up chat</h1>
+  <p class="subtitle">Choose your account, then open chat.
+     <a href="/_openhost/community/help" style="color:#a5b4fc">Learn more</a>.</p>
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
 
   <form method="POST" action="/_openhost/community/onboarding">
+    <input type="hidden" name="action" value="finish">
     <div class="card">
-      <label for="username">Choose your chat username</label>
-      <input type="text" id="username" name="username" value="{{ suggested }}"
-             pattern="[a-z0-9._=-]+" required autocomplete="off">
-      <p class="hint">Lowercase letters, numbers, and . _ = - only. Your Matrix
-         address will be <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
+      <div class="row">
+        <div>
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" value="{{ suggested }}"
+                 pattern="[a-z0-9._=-]+" required autocomplete="off" placeholder="alice">
+        </div>
+        <div>
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" required
+                 minlength="8" autocomplete="new-password" placeholder="min 8 characters">
+        </div>
+      </div>
+      <p class="hint">You'll be signed in automatically. This password also works
+         from other Matrix clients. Address: <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
+
       <label class="consent">
-        <input type="checkbox" name="consent" value="1" required>
-        <span>I understand what community chat does and the considerations above,
-              and I want to enable it.</span>
+        <input type="checkbox" name="enable_federation" value="1" checked>
+        <span>Enable federation (connect to other Matrix servers).</span>
       </label>
+      {% if community_room_alias %}
+      <label class="consent">
+        <input type="checkbox" name="join_community" value="1" checked>
+        <span>Join the OpenHost community room.</span>
+      </label>
+      {% endif %}
+      <p class="hint">Federation needs a publicly reachable instance.
+         <a href="/_openhost/community/help" style="color:#a5b4fc">Details</a>.</p>
     </div>
 
-    {% if community_room_alias %}
-    <div class="card">
-      <h2>Join the OpenHost community?</h2>
-      <p>Optionally join the OpenHost community room
-         (<code>{{ community_room_alias }}</code>) to chat with other OpenHost
-         users. This <strong>enables federation</strong> so your server can reach
-         the community's server — review the considerations above first. You can
-         also do this later, or leave it off to keep your server fully private.</p>
-      <label class="consent">
-        <input type="checkbox" name="join_community" value="1">
-        <span>Yes, enable federation and join the OpenHost community room.</span>
-      </label>
-    </div>
-    {% endif %}
-
-    <button type="submit" class="btn">Enable community chat</button>
+    <button type="submit" class="btn">Finish &amp; open chat</button>
   </form>
+</div></body></html>
+"""
+
+
+HELP_TEMPLATE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Community Chat: help</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
+  .container{max-width:640px;margin:0 auto}
+  h1{font-size:1.5rem;color:#f8fafc;margin-bottom:.25rem}
+  h2{font-size:1.05rem;color:#f1f5f9;margin:1.25rem 0 .4rem}
+  p,li{color:#cbd5e1;font-size:.92rem;line-height:1.55}
+  ul{margin:.4rem 0 0 1.1rem}
+  code{color:#a5b4fc}
+  a.back{display:inline-block;margin-top:1.5rem;color:#a5b4fc}
+</style></head>
+<body><div class="container">
+  <h1>Community Chat</h1>
+  <p>This runs a private Matrix homeserver on your instance with a built-in web
+     chat client. You sign in to it automatically as your account.</p>
+
+  <h2>Your account</h2>
+  <p>You choose one username and password. The built-in web client signs you in
+     automatically, and the same username and password also work from any
+     third-party Matrix client (Element, FluffyChat, etc.). Usernames use
+     lowercase letters, numbers, and <code>. _ = -</code> only, giving a Matrix
+     address like <code>@name:{{ server_name }}</code>. You can change the
+     password later from the admin console.</p>
+
+  <h2>Federation</h2>
+  <ul>
+    <li>Federation lets your server talk to other Matrix servers, including the
+        OpenHost community. It is optional and can be toggled anytime in the admin
+        console.</li>
+    <li>Running a federated server may carry responsibilities (content, data, and
+        legal considerations) that vary by jurisdiction.</li>
+    <li>Federation needs a publicly reachable instance; it will not work on
+        setups without public inbound HTTPS (e.g. some tunnel-only configs).</li>
+  </ul>
+
+  <h2>OpenHost community room</h2>
+  <p>Optionally join the shared OpenHost community room to chat with other
+     OpenHost users. This requires federation so your server can reach the
+     community's server. You can leave it off to keep your server fully private.</p>
+
+  <a class="back" href="/_openhost/community/onboarding">&larr; Back to setup</a>
 </div></body></html>
 """
 
@@ -810,17 +1090,24 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
   a.btn{display:inline-block;margin-top:1rem;padding:.6rem 1rem;background:#6366f1;color:#fff;border-radius:.5rem;text-decoration:none}
 </style></head>
 <body><div class="container">
-  <h1>Community chat is enabled</h1>
+  <h1>Almost there</h1>
   <div class="card">
-    <p>You opted to join the OpenHost community room
-       (<code>{{ room_alias }}</code>). This turned on <strong>federation</strong>.</p>
-    <p><strong>Restart this app</strong> from your OpenHost dashboard to activate
-       federation. Once it restarts, your server will join the community room
-       automatically in the background.</p>
-    <p>You can start using chat now; the community room will appear after the
-       restart completes.</p>
+    <p>The app is <strong>restarting automatically</strong> to turn on
+       federation. This page reconnects and opens chat on its own when it's
+       ready, no action needed.</p>
     <a class="btn" href="/_openhost/community/login">Open chat</a>
   </div>
+  <script>
+    // Poll until the app is back up after the automatic restart, then continue.
+    (function(){
+      function ping(){
+        fetch("/_matrix/client/versions",{cache:"no-store"})
+          .then(function(r){ if(r.ok){ location.replace("/_openhost/community/login"); } })
+          .catch(function(){});
+      }
+      setInterval(ping, 3000);
+    })();
+  </script>
 </div></body></html>
 """
 
@@ -829,16 +1116,52 @@ JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
 # URL handling. Restrict to the safe, portable subset.
 _USERNAME_RE = re.compile(r"^[a-z0-9._=-]+$")
 
+# Minimum password length for accounts created via the admin UI / onboarding.
+_MIN_PASSWORD_LEN = 8
+
+
+def create_account(username: str, password: str, admin: bool = False) -> str | None:
+    """Validate inputs and register a Matrix account via the shared-secret API.
+
+    Returns None on success, or a user-facing error string on failure. Used by
+    onboarding to create the single owner account.
+    """
+    username = (username or "").strip().lower()
+    password = password or ""
+    if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
+        return "Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
+    if len(password) < _MIN_PASSWORD_LEN:
+        return f"Password must be at least {_MIN_PASSWORD_LEN} characters."
+    try:
+        _shared_secret_register(username, password, admin=admin)
+    except SSOError as exc:
+        detail = str(exc)
+        if "M_USER_IN_USE" in detail or "409" in detail:
+            return f"Username '{username}' is already taken."
+        app.logger.error("create_account: registration failed: %s", exc)
+        return "Could not create account. Check the app logs."
+    return None
+
+
+def _render_onboarding(server, room_alias, *, error=None, suggested=None):
+    if suggested is None:
+        suggested = _default_account_username()
+    return render_template_string(
+        ONBOARDING_TEMPLATE,
+        error=error,
+        suggested=suggested,
+        server_name=server,
+        community_room_alias=room_alias,
+    )
+
 
 @app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
 def community_onboarding():
-    """First-run consent + username flow. Owner-only (zone_auth gated)."""
+    """First-run flow: set up the single owner account, then finish. Owner-only
+    (zone_auth gated)."""
     settings = load_settings()
-    if not settings.get("community_enabled", False):
-        return "Community chat is not enabled.", 404
-    # Onboarding is one-time: once done, the Matrix account exists under the
-    # chosen username, so re-running this must not silently re-point it. Send
-    # already-onboarded owners straight to login instead.
+    # Onboarding is one-time: once finished, send already-onboarded owners
+    # straight to login instead.
     if settings.get("community_onboarded", False):
         return redirect("/_openhost/community/login", code=302)
     server = ""
@@ -849,69 +1172,92 @@ def community_onboarding():
 
     room_alias = settings.get("community_room_alias", "")
 
-    if request.method == "POST":
-        username = (request.form.get("username") or "").strip().lower()
-        consent = request.form.get("consent") == "1"
-        join_community = request.form.get("join_community") == "1"
-        error = None
-        if not consent:
-            error = "Please confirm you understand before enabling."
-        elif not username or not _USERNAME_RE.match(username) or username.startswith("_"):
-            error = "Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
+    if request.method != "POST":
+        return _render_onboarding(server, room_alias)
+
+    # --- Finish onboarding: create the single owner account -------------------
+    owner_username = (request.form.get("username") or "").strip().lower()
+    owner_password = request.form.get("password") or ""
+    enable_federation = request.form.get("enable_federation") == "1"
+    join_community = request.form.get("join_community") == "1"
+    # Joining the community room requires federation, so a join implies it.
+    if join_community:
+        enable_federation = True
+
+    # Create the owner's Matrix account (single account). If the name is already
+    # taken, we require the matching password (so re-running with the same
+    # credentials is fine, but you can't hijack an existing account).
+    existing = []
+    try:
+        existing = list_user_localparts()
+    except SSOError:
+        existing = []
+    if owner_username in existing:
+        # Account already exists (e.g. resubmit): verify the password matches.
+        try:
+            _synapse_request(
+                "POST",
+                "/_matrix/client/v3/login",
+                body={
+                    "type": "m.login.password",
+                    "identifier": {"type": "m.id.user", "user": owner_username},
+                    "password": owner_password,
+                    "initial_device_display_name": "OpenHost onboarding check",
+                },
+            )
+        except SSOError:
+            return _render_onboarding(
+                server, room_alias, suggested=owner_username,
+                error=f"@{owner_username} already exists and the password doesn't match.",
+            )
+    else:
+        error = create_account(owner_username, owner_password, admin=True)
         if error:
-            return render_template_string(
-                ONBOARDING_TEMPLATE,
-                error=error,
-                suggested=username,
-                server_name=server,
-                community_room_alias=room_alias,
-            )
-        settings["community_username"] = username
-        settings["community_onboarded"] = True
-        save_settings(settings)
+            return _render_onboarding(server, room_alias, suggested=owner_username, error=error)
 
-        # Explicit, opt-in community join: only if the owner ticked the box AND a
-        # room alias is configured. Never automatic.
-        #
-        # Joining a *remote* (federated) room alias requires federation to be
-        # enabled AND active in the running Synapse. Enabling federation only
-        # takes effect after an app restart (SIGHUP doesn't reliably reload it),
-        # so we can't reliably join in this same request. Instead we record the
-        # intent + turn federation on, and the join is completed on the next boot
-        # by the background worker in this module (see _complete_pending_community_join).
-        if join_community and room_alias:
-            settings = load_settings()
-            settings["federation_enabled"] = True
-            settings["community_join_pending"] = True
-            save_settings(settings)
-            try:
-                apply_settings_to_yaml(settings)
-            except OSError as exc:
-                app.logger.error("could not apply federation setting: %s", exc)
-                # Don't claim success if we couldn't patch homeserver.yaml; keep the
-                # message generic so filesystem details aren't exposed to the client.
-                return render_template_string(
-                    ONBOARDING_TEMPLATE,
-                    error="Enabled chat, but could not turn on federation to join the "
-                    "community. You can retry from the admin console.",
-                    suggested=username,
-                    server_name=server,
-                    community_room_alias=room_alias,
-                )
-            # Federation only activates on restart; the join then completes
-            # automatically in the background. Tell the owner to restart.
-            return render_template_string(
-                JOIN_PENDING_TEMPLATE, room_alias=room_alias
-            )
-        return redirect("/_openhost/community/login", code=302)
+    # Persist the chosen password (0600) so SSO auto-login reuses it instead of
+    # rotating it, keeping the password working from other Matrix clients too.
+    _store_owner_password(owner_username, owner_password)
 
-    return render_template_string(
-        ONBOARDING_TEMPLATE,
-        error=None,
-        suggested="owner",
-        server_name=server,
-        community_room_alias=room_alias,
-    )
+    settings["community_username"] = owner_username
+    settings["community_onboarded"] = True
+    # A community-room join is pending only if the owner opted in AND a room
+    # alias is configured. Joining a remote (federated) alias requires
+    # federation active in the running Synapse, which only takes effect after
+    # a restart, so the join is completed on the next boot by
+    # _complete_pending_community_join.
+    want_join = bool(join_community and room_alias)
+    settings["federation_enabled"] = enable_federation
+    settings["community_join_pending"] = want_join
+    save_settings(settings)
+
+    # Applying federation requires patching homeserver.yaml + an app restart.
+    if enable_federation:
+        try:
+            apply_settings_to_yaml(settings)
+        except OSError as exc:
+            app.logger.error("could not apply federation setting: %s", exc)
+            return _render_onboarding(
+                server, room_alias,
+                error="Set up chat, but could not turn on federation. You can "
+                "retry from the admin console.",
+            )
+        # Federation activates on the automatic restart; any pending community
+        # join then completes in the background. This page polls and continues.
+        request_app_restart()
+        return render_template_string(JOIN_PENDING_TEMPLATE)
+    return redirect("/_openhost/community/login", code=302)
+
+
+@app.route("/_openhost/community/help")
+def community_help():
+    """Detailed help for the onboarding flow. Owner-only (zone_auth gated)."""
+    server = ""
+    try:
+        server = _server_name()
+    except SSOError:
+        pass
+    return render_template_string(HELP_TEMPLATE, server_name=server)
 
 
 @app.route("/_openhost/community/login")
@@ -919,11 +1265,9 @@ def community_login():
     """Owner SSO entrypoint: mint a Matrix session and hand it to the web client.
 
     Only reachable by the OpenHost owner (zone_auth gates this subdomain path).
-    Redirects to onboarding on first run until consent is recorded.
+    Redirects to onboarding on first run until setup is complete.
     """
     settings = load_settings()
-    if not settings.get("community_enabled", False):
-        return "Community chat is not enabled.", 404
     if not settings.get("community_onboarded", False):
         return redirect("/_openhost/community/onboarding", code=302)
     username = _owner_matrix_username()
@@ -993,8 +1337,32 @@ def _complete_pending_community_join() -> None:
     app.logger.error("pending community join failed after retries (will retry next boot): %s", last_exc)
 
 
+def _cli_apply_settings() -> int:
+    """Patch homeserver.yaml (registration + federation) from openhost_settings.json.
+
+    Invoked by start.sh on every boot ("python3 admin.py apply-settings") so the
+    boot-time config patching and the admin-UI-time patching share ONE
+    implementation (apply_settings_to_yaml) — no duplicated, drifting regex.
+    """
+    settings = load_settings()
+    if not HOMESERVER_YAML.exists():
+        sys.stderr.write(f"apply-settings: {HOMESERVER_YAML} not found\n")
+        return 0  # nothing to patch yet; not fatal
+    try:
+        apply_settings_to_yaml(settings)
+    except OSError as exc:
+        sys.stderr.write(f"apply-settings: {exc}\n")
+        return 1
+    sys.stderr.write(
+        "apply-settings: federation_enabled=%s open_registration=%s\n"
+        % (settings["federation_enabled"], settings["open_registration"])
+    )
+    return 0
+
+
 if __name__ == "__main__":
-    import threading
+    if len(sys.argv) > 1 and sys.argv[1] == "apply-settings":
+        raise SystemExit(_cli_apply_settings())
 
     threading.Thread(target=_complete_pending_community_join, daemon=True).start()
     port = int(os.environ.get("ADMIN_PORT", "8009"))
