@@ -44,14 +44,24 @@ Implementation notes:
 
 - SSO mints a Matrix session for the owner by talking to Synapse over
   `localhost:8008` (bypassing the router/zone-auth): it registers a one-time
-  admin service account via Synapse's registration shared secret, ensures the
-  owner's user exists, sets a fresh ephemeral password, and performs a normal
-  `m.login.password` to obtain a real `device_id` + access token. Only the
-  service account's access token (never a password) is persisted, in
-  `openhost_sso.json` (mode 0600).
+  admin service account via Synapse's registration shared secret and performs a
+  normal `m.login.password` as the owner to obtain a real `device_id` + access
+  token (matrix-js-sdk/Cinny require a real `device_id`).
+- To sign in as the owner, SSO reuses the **owner's own chosen password** — the
+  one set for that account during onboarding — rather than rotating it. This is
+  what lets the owner keep signing in with the same username/password from other
+  Matrix clients (e.g. a phone). To do this without prompting on every load, the
+  owner's password is **stored at rest** in `openhost_sso.json` (mode 0600),
+  alongside the admin service account's access token. This file therefore
+  contains secrets and should be treated accordingly (it never leaves the
+  instance and is only readable by the app user). For instances onboarded before
+  this behavior existed (no stored owner password), SSO falls back to setting a
+  fresh password once via the admin API and then persists it so subsequent
+  logins stop rotating.
 - Accounts created during onboarding / from the admin UI are registered via
   Synapse's shared-secret admin register API with the username and password you
-  provide.
+  provide. Only the owner account's password is stored by the app (for SSO);
+  other accounts' passwords are never persisted by the app.
 - The client is handed the owner session by a small bootstrap page that seeds
   Cinny's localStorage session keys and redirects into the app.
 - The Caddy routing and web client config are rendered by `start.sh` on boot.
@@ -143,6 +153,7 @@ Connect with any Matrix client (Element, FluffyChat, etc.) using your server URL
 All persistent data lives in `$OPENHOST_APP_DATA_DIR/`:
 - `homeserver.yaml` -- Synapse configuration (regenerated on first boot, patched on subsequent boots)
 - `openhost_settings.json` -- Admin UI settings (source of truth for federation and registration)
+- `openhost_sso.json` -- SSO state (mode 0600): the admin service account's access token and the owner account's stored password used for auto-login. Contains secrets.
 - `*.signing.key` -- Signing keys (back these up; losing them breaks room continuity)
 - `homeserver.db` -- SQLite database (users, rooms, messages, etc.)
 - `media_store/` -- Uploaded media and thumbnails
