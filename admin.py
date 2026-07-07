@@ -707,6 +707,31 @@ def list_user_localparts() -> list[str]:
 # fast, so a process-wide lock is the simplest correct fix.
 _sso_lock = threading.Lock()
 
+# Passwords typed while creating accounts during the (one-time) onboarding flow,
+# kept only in memory so "Finish setup" can reuse the chosen owner account's
+# password without asking the user to retype it. This is transient onboarding
+# state — it is NOT persisted; only the finally-chosen owner password is written
+# to disk (openhost_sso.json) at finish. Guarded by a lock; cleared once
+# onboarding completes. If the process restarts mid-onboarding this is lost, and
+# finish falls back to prompting for the password.
+_onboarding_passwords: dict[str, str] = {}
+_onboarding_lock = threading.Lock()
+
+
+def _remember_onboarding_password(username: str, password: str) -> None:
+    with _onboarding_lock:
+        _onboarding_passwords[username] = password
+
+
+def _recall_onboarding_password(username: str) -> str | None:
+    with _onboarding_lock:
+        return _onboarding_passwords.get(username)
+
+
+def _clear_onboarding_passwords() -> None:
+    with _onboarding_lock:
+        _onboarding_passwords.clear()
+
 
 def _store_owner_password(username: str, password: str) -> None:
     """Persist the owner account's password in the 0600 SSO state file so SSO can
@@ -1030,11 +1055,16 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
         <option value="{{ a }}"{% if a == suggested %} selected{% endif %}>@{{ a }}:{{ server_name }}</option>
         {% endfor %}
       </select>
+      {% if need_password %}
       <label for="owner_password" style="margin-top:1rem">Password for that account</label>
       <input type="password" id="owner_password" name="owner_password" required
              autocomplete="current-password" placeholder="the password you set for it">
-      <p class="hint">Confirms the account you'll be auto-signed-in as. This
-         password keeps working from other clients too.</p>
+      <p class="hint">We couldn't recover the password you set — re-enter it for
+         the account you'll be auto-signed-in as.</p>
+      {% else %}
+      <p class="hint">You'll be auto-signed-in as this account using the password
+         you set for it.</p>
+      {% endif %}
       {% else %}
       <p class="hint">Create at least one account above before finishing.</p>
       {% endif %}
@@ -1135,7 +1165,8 @@ def create_account(username: str, password: str, admin: bool = False) -> str | N
     return None
 
 
-def _render_onboarding(server, room_alias, *, error=None, notice=None, suggested="owner"):
+def _render_onboarding(server, room_alias, *, error=None, notice=None,
+                       suggested="owner", need_password=False):
     accounts = []
     try:
         accounts = list_user_localparts()
@@ -1149,6 +1180,7 @@ def _render_onboarding(server, room_alias, *, error=None, notice=None, suggested
         accounts=accounts,
         server_name=server,
         community_room_alias=room_alias,
+        need_password=need_password,
     )
 
 
@@ -1181,15 +1213,18 @@ def community_onboarding():
         error = create_account(username, password, admin=False)
         if error:
             return _render_onboarding(server, room_alias, suggested=username, error=error)
+        # Remember the password in memory so "Finish" can auto-select this account
+        # as the owner without re-prompting.
+        _remember_onboarding_password(username, password)
         return _render_onboarding(
-            server, room_alias, notice=f"Created @{username}. Add more, or finish below.",
+            server, room_alias, suggested=username,
+            notice=f"Created @{username}. Add more, or finish below.",
         )
 
     # --- Finish onboarding ----------------------------------------------------
     if action == "finish":
         consent = request.form.get("consent") == "1"
         owner_username = (request.form.get("owner_username") or "").strip().lower()
-        owner_password = request.form.get("owner_password") or ""
         join_community = request.form.get("join_community") == "1"
 
         try:
@@ -1211,6 +1246,20 @@ def community_onboarding():
                 server, room_alias, error="Choose which account to sign in as.",
             )
 
+        # Reuse the password the owner typed when creating this account (kept in
+        # memory during onboarding) so they don't have to retype it. Only if it
+        # was lost (e.g. a mid-onboarding process restart) do we fall back to the
+        # optional re-entry field.
+        owner_password = _recall_onboarding_password(owner_username)
+        if not owner_password:
+            owner_password = request.form.get("owner_password") or ""
+        if not owner_password:
+            return _render_onboarding(
+                server, room_alias, suggested=owner_username, need_password=True,
+                error=f"Re-enter the password for @{owner_username} to finish "
+                "(we couldn't recover the one you set).",
+            )
+
         # Verify the password for the chosen owner account by attempting a real
         # login. We persist it (0600) so SSO auto-login reuses it instead of
         # rotating it — that way the password the owner set keeps working
@@ -1228,11 +1277,12 @@ def community_onboarding():
             )
         except SSOError:
             return _render_onboarding(
-                server, room_alias, suggested=owner_username,
+                server, room_alias, suggested=owner_username, need_password=True,
                 error=f"That password doesn't match @{owner_username}. Enter the "
                 "password you set for the account you want to sign in as.",
             )
         _store_owner_password(owner_username, owner_password)
+        _clear_onboarding_passwords()  # onboarding done; drop transient secrets
 
         settings["community_username"] = owner_username
         settings["community_onboarded"] = True
