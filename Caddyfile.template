@@ -45,7 +45,10 @@
 		expression {http.request.uri.query.timeout}.matches('^[0-9]+$') && int({http.request.uri.query.timeout}) >= 25000
 	}
 	handle @bigsync {
-		uri query timeout 20000
+		# uri replace (regex-free substring swap) works on the older Caddy in the
+		# base image; `uri query` requires Caddy 2.7+ which isn't bundled. Only
+		# the exact timeout=<value> pair is swapped, so since/filter/etc. are kept.
+		uri replace timeout={http.request.uri.query.timeout} timeout=20000
 		reverse_proxy localhost:8008 {
 			header_up Host {header.X-Forwarded-Host}
 		}
