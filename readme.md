@@ -185,7 +185,13 @@ To change federation or registration settings, use the admin UI. Direct edits to
 
 - `Dockerfile` -- extends the official Synapse image with Caddy, Flask, and the bundled Cinny web client
 - `start.sh` -- generates config on first boot, applies settings from `openhost_settings.json` on every boot, renders the Cinny config, and supervises Caddy, the admin UI, and Synapse (exits to trigger an automatic restart when requested)
-- `Caddyfile.template` -- Caddy config template; serves the Cinny client at the root, routes `/_openhost/*` to the admin/onboarding UI, and proxies `/_matrix` + `/_synapse` to Synapse
+- `Caddyfile.template` -- Caddy config template; serves the Cinny client at the root, routes `/_openhost/*` to the admin/onboarding UI, and proxies `/_matrix` + `/_synapse` to Synapse. It also caps the Matrix `/sync` long-poll `timeout` to 20s (see "Sync long-poll cap" below).
 - `admin.py` -- Flask app serving the admin UI, onboarding, and owner SSO on port 8009
 - `webclient-config.template.json` -- Cinny config template (homeserver pinned at boot)
 - `openhost.toml` -- OpenHost app manifest (2048 MB RAM, 2 CPU cores, app_data storage)
+
+## Sync long-poll cap
+
+Matrix clients keep their session alive by long-polling `GET /_matrix/client/*/sync?timeout=<ms>` (matrix-js-sdk/Cinny default 30000ms). Synapse holds that request open for the requested duration. The OpenHost router proxies app requests with a ~30s read timeout, so a sync that holds the full ~30s is cut off and the client receives `504 App timed out`, which it surfaces as an intermittent disconnection.
+
+To avoid this, the Caddyfile rewrites the client-requested `timeout` on `/sync` requests down to 20000ms (comfortably under the router's ~30s) so Synapse always responds first. Only requests explicitly asking for >= 25000ms are rewritten; smaller values and the initial `timeout=0` sync pass through untouched.

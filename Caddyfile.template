@@ -26,6 +26,34 @@
 		reverse_proxy localhost:8009
 	}
 
+	# Matrix /sync long-poll cap.
+	#
+	# Matrix clients keep their session alive by long-polling
+	# GET /_matrix/client/*/sync?timeout=<ms> (matrix-js-sdk/Cinny default 30000).
+	# Synapse holds that request open for the requested duration. The OpenHost
+	# router proxies app requests with a ~30s read timeout, so a sync that holds
+	# the full ~30s is cut off and the client gets 504 "App timed out", which it
+	# surfaces as an intermittent disconnection.
+	#
+	# Cap the client-requested timeout to 20s (comfortably under the router's
+	# ~30s) so Synapse always responds before the router gives up. Only requests
+	# that explicitly ask for >= 25s are rewritten; smaller values and the
+	# initial timeout=0 sync pass through untouched (the matches() guard keeps
+	# int() from erroring on absent/non-numeric values).
+	@bigsync {
+		path_regexp sync ^/_matrix/client/(v3|r0|unstable)/sync$
+		expression {http.request.uri.query.timeout}.matches('^[0-9]+$') && int({http.request.uri.query.timeout}) >= 25000
+	}
+	handle @bigsync {
+		# uri replace (regex-free substring swap) works on the older Caddy in the
+		# base image; `uri query` requires Caddy 2.7+ which isn't bundled. Only
+		# the exact timeout=<value> pair is swapped, so since/filter/etc. are kept.
+		uri replace timeout={http.request.uri.query.timeout} timeout=20000
+		reverse_proxy localhost:8008 {
+			header_up Host {header.X-Forwarded-Host}
+		}
+	}
+
 	# Matrix client-server + federation APIs -> Synapse.
 	handle /_matrix* {
 		reverse_proxy localhost:8008 {
