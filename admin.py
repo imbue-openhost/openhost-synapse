@@ -699,6 +699,28 @@ def list_user_localparts() -> list[str]:
 _sso_lock = threading.Lock()
 
 
+def _admin_set_password(username: str, password: str, *, logout_devices: bool) -> None:
+    """Set a user's password via Synapse's admin API (PUT /_synapse/admin/v2/users).
+
+    Shared by the SSO-login backward-compat fallback, the admin password-change
+    page, and onboarding's existing-account takeover so the URL-quoting and the
+    (deliberately per-caller) logout_devices flag stay consistent in one place.
+
+    logout_devices controls whether existing sessions/access tokens are
+    invalidated: pass True to fully reclaim an account (onboarding takeover),
+    False to preserve the owner's live sessions (routine password change / SSO
+    fallback).
+    """
+    admin_token = _get_admin_token()
+    user_id = f"@{username}:{_server_name()}"
+    _synapse_request(
+        "PUT",
+        f"/_synapse/admin/v2/users/{urllib.parse.quote(user_id, safe='')}",
+        token=admin_token,
+        body={"password": password, "logout_devices": logout_devices},
+    )
+
+
 def _store_owner_password(username: str, password: str) -> None:
     """Persist the owner account's current password in the 0600 SSO state file
     so SSO can log in as them WITHOUT rotating (overwriting) it on every load.
@@ -757,14 +779,8 @@ def _sso_login_for_owner_locked(username: str) -> dict:
         # change, or SSO state lost). Set one via the admin API and persist it so
         # future logins reuse it instead of rotating. logout_devices=False so we
         # don't kill the owner's existing sessions.
-        admin_token = _get_admin_token()
         password = _generate_password()
-        _synapse_request(
-            "PUT",
-            f"/_synapse/admin/v2/users/{user_id}",
-            token=admin_token,
-            body={"password": password, "logout_devices": False},
-        )
+        _admin_set_password(username, password, logout_devices=False)
         _store_owner_password(username, password)
 
     # Normal client login -> real device_id + access_token. No password change.
@@ -823,17 +839,9 @@ def accounts_password():
         return _render_index(warning=f"Password must be at least {_MIN_PASSWORD_LEN} characters.")
     username = _owner_matrix_username()
     try:
-        admin_token = _get_admin_token()
-        server = _server_name()
-        user_id = f"@{username}:{server}"
         # logout_devices=False so changing the password doesn't kill existing
         # chat sessions (e.g. a mobile client).
-        _synapse_request(
-            "PUT",
-            f"/_synapse/admin/v2/users/{urllib.parse.quote(user_id, safe='')}",
-            token=admin_token,
-            body={"password": password, "logout_devices": False},
-        )
+        _admin_set_password(username, password, logout_devices=False)
     except SSOError as exc:
         app.logger.error("accounts_password: could not set password: %s", exc)
         return _render_index(warning="Could not update password. Check the app logs.")
@@ -1130,6 +1138,20 @@ _USERNAME_RE = re.compile(r"^[a-z0-9._=-]+$")
 # Minimum password length for accounts created via the admin UI / onboarding.
 _MIN_PASSWORD_LEN = 8
 
+_INVALID_USERNAME_MSG = (
+    "Invalid username. Use lowercase letters, numbers, and . _ = - "
+    "(not starting with _)."
+)
+
+
+def _validate_username(username: str) -> str | None:
+    """Return None if the (already normalized) username is valid, else a
+    user-facing error string. Shared by create_account and onboarding so the
+    rule and message live in one place."""
+    if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
+        return _INVALID_USERNAME_MSG
+    return None
+
 
 def create_account(username: str, password: str, admin: bool = False) -> str | None:
     """Validate inputs and register a Matrix account via the shared-secret API.
@@ -1139,8 +1161,9 @@ def create_account(username: str, password: str, admin: bool = False) -> str | N
     """
     username = (username or "").strip().lower()
     password = password or ""
-    if not username or not _USERNAME_RE.match(username) or username.startswith("_"):
-        return "Invalid username. Use lowercase letters, numbers, and . _ = - (not starting with _)."
+    err = _validate_username(username)
+    if err:
+        return err
     if len(password) < _MIN_PASSWORD_LEN:
         return f"Password must be at least {_MIN_PASSWORD_LEN} characters."
     try:
@@ -1204,22 +1227,23 @@ def community_onboarding():
 
     # Validate the username up front (create_account also validates, but we may
     # take the "already exists" branch which skips it).
-    if (
-        not owner_username
-        or not _USERNAME_RE.match(owner_username)
-        or owner_username.startswith("_")
-    ):
+    username_error = _validate_username(owner_username)
+    if username_error:
         return _render_onboarding(
-            server, room_alias, suggested=owner_username,
-            error="Invalid username. Use lowercase letters, numbers, and "
-            ". _ = - (not starting with _).",
+            server, room_alias, suggested=owner_username, error=username_error,
         )
 
     # Create the owner's Matrix account (single account). If the name is already
-    # taken (e.g. a resubmit or an existing account), reset its password to the
-    # freshly generated one via the admin API so SSO auto-login works. There is
-    # no password prompt to match against anymore, and this path is owner-only
-    # (zone_auth gates onboarding), so resetting is safe.
+    # taken, reset its password to the freshly generated one via the admin API so
+    # SSO auto-login works. There is no password prompt to match against anymore.
+    #
+    # SECURITY: open registration is on by default and /_matrix registration is
+    # public, so a third party could pre-register the owner's (predictable)
+    # username before the owner onboards. This first-run takeover therefore uses
+    # logout_devices=True to invalidate ANY pre-existing sessions/access tokens on
+    # that account (e.g. an attacker's), so onboarding fully reclaims it. This is
+    # the opposite of the admin password-change page, where preserving the owner's
+    # own live sessions (logout_devices=False) is the correct behaviour.
     existing = []
     try:
         existing = list_user_localparts()
@@ -1227,18 +1251,10 @@ def community_onboarding():
         existing = []
     if owner_username in existing:
         try:
-            admin_token = _get_admin_token()
             # Resolve the server name properly (the page-level `server` may be
             # empty if it wasn't readable at render time). list_user_localparts
             # above already succeeded, so Synapse is reachable here.
-            user_id = f"@{owner_username}:{_server_name()}"
-            # logout_devices=False so we don't kill any existing chat sessions.
-            _synapse_request(
-                "PUT",
-                f"/_synapse/admin/v2/users/{urllib.parse.quote(user_id, safe='')}",
-                token=admin_token,
-                body={"password": owner_password, "logout_devices": False},
-            )
+            _admin_set_password(owner_username, owner_password, logout_devices=True)
         except SSOError as exc:
             app.logger.error("onboarding: could not reset existing account password: %s", exc)
             return _render_onboarding(
