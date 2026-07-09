@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Fast, hermetic checks on the build/config invariants. No network or Docker.
+  config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run config/build invariant tests
+        run: python3 -m unittest discover -s tests -v
+
+  # End-to-end check that the pinned Cinny builds with the patch applied and
+  # that the transient "Connecting..." banner is gone (error banners kept).
+  # Mirrors the Dockerfile's cinny-builder stage.
+  cinny-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build patched Cinny and verify banner behavior
+        run: bash tests/test_cinny_build.sh
+
+  # Validate the Dockerfile actually builds (multi-stage, patch, guards) so a
+  # broken build is caught in CI rather than at deploy time.
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container image
+        run: docker build -t openhost-synapse:ci .
