@@ -5,7 +5,8 @@ OpenHost Synapse Admin UI
 Serves a simple web interface at /_openhost/admin for managing:
   - Federation (enable/disable)
   - Open registration (enable/disable)
-  - Chat accounts (create as many as you like, with chosen usernames/passwords)
+  - The chat account password (used only for third-party Matrix clients; the
+    built-in web client signs the owner in automatically via SSO)
 
 Settings are persisted to openhost_settings.json in the Synapse data dir.
 On change, homeserver.yaml is patched and the app restarts itself automatically
@@ -415,8 +416,10 @@ TEMPLATE = """<!DOCTYPE html>
     <div class="card">
       <div class="setting-info" style="margin-bottom:1rem">
         <h2>Chat account</h2>
-        <p>Your account is signed in automatically in the built-in web client.
-           The password below also works from any third-party Matrix client.</p>
+        <p>Your account is signed in automatically in the built-in web client,
+           so you do not need a password for it. Set a password here only if you
+           want to sign in from a third-party Matrix client (Element,
+           FluffyChat, etc.).</p>
       </div>
       {% if owner_username %}
       <div style="padding:.5rem .75rem;background:#0d1117;border:1px solid #2d3348;border-radius:.4rem;margin-bottom:1rem;font-family:monospace;color:#a5b4fc">
@@ -425,7 +428,7 @@ TEMPLATE = """<!DOCTYPE html>
       <form method="POST" action="/_openhost/admin/accounts/password"
             style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end">
         <div style="flex:1;min-width:180px">
-          <label for="new_password" style="display:block;font-size:.8rem;color:#94a3b8;margin-bottom:.3rem">Change password</label>
+          <label for="new_password" style="display:block;font-size:.8rem;color:#94a3b8;margin-bottom:.3rem">Set password for third-party clients</label>
           <input type="password" id="new_password" name="password" required
             minlength="8" autocomplete="new-password"
             placeholder="at least 8 characters"
@@ -434,7 +437,8 @@ TEMPLATE = """<!DOCTYPE html>
         <button type="submit" class="save-btn" style="margin-top:0;width:auto;padding:.55rem 1.25rem">Update</button>
       </form>
       <p style="font-size:.75rem;color:#64748b;margin-top:.75rem">
-        Changing the password does not restart the app.</p>
+        Setting a password does not restart the app or sign you out of the
+        built-in web client.</p>
       {% else %}
       <p style="font-size:.8rem;color:#64748b">No account set up yet. Open the app to finish setup.</p>
       {% endif %}
@@ -991,7 +995,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
 </style></head>
 <body><div class="container">
   <h1>Set up chat</h1>
-  <p class="subtitle">Choose your account, then open chat.
+  <p class="subtitle">Choose a username, then open chat.
      <a href="/_openhost/community/help" style="color:#a5b4fc">Learn more</a>.</p>
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
@@ -1005,14 +1009,12 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
           <input type="text" id="username" name="username" value="{{ suggested }}"
                  pattern="[a-z0-9._=-]+" required autocomplete="off" placeholder="alice">
         </div>
-        <div>
-          <label for="password">Password</label>
-          <input type="password" id="password" name="password" required
-                 minlength="8" autocomplete="new-password" placeholder="min 8 characters">
-        </div>
       </div>
-      <p class="hint">You'll be signed in automatically. This password also works
-         from other Matrix clients. Address: <code>@&lt;username&gt;:{{ server_name }}</code>.</p>
+      <p class="hint">You'll be signed in to the built-in chat automatically, so
+         no password is needed here. Address:
+         <code>@&lt;username&gt;:{{ server_name }}</code>. To sign in from a
+         third-party Matrix client (Element, FluffyChat, etc.), set a password
+         later on the admin settings page (<code>/_openhost/admin</code>).</p>
 
       {% if community_room_alias %}
       <label class="consent">
@@ -1052,12 +1054,12 @@ HELP_TEMPLATE = """<!DOCTYPE html>
      chat client. You sign in to it automatically as your account.</p>
 
   <h2>Your account</h2>
-  <p>You choose one username and password. The built-in web client signs you in
-     automatically, and the same username and password also work from any
-     third-party Matrix client (Element, FluffyChat, etc.). Usernames use
+  <p>You choose one username. The built-in web client signs you in
+     automatically, so no password is needed to chat here. Usernames use
      lowercase letters, numbers, and <code>. _ = -</code> only, giving a Matrix
-     address like <code>@name:{{ server_name }}</code>. You can change the
-     password later from the admin console.</p>
+     address like <code>@name:{{ server_name }}</code>. To sign in from a
+     third-party Matrix client (Element, FluffyChat, etc.), set a password on
+     the admin console (<code>/_openhost/admin</code>) after setup.</p>
 
   <h2>Federation</h2>
   <ul>
@@ -1161,8 +1163,10 @@ def _render_onboarding(server, room_alias, *, error=None, suggested=None):
 
 @app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
 def community_onboarding():
-    """First-run flow: set up the single owner account, then finish. Owner-only
-    (zone_auth gated)."""
+    """First-run flow: set up the single owner account (username only), then
+    finish. No password is entered here: the built-in web client signs the owner
+    in via SSO, and a password for third-party clients can be set later on the
+    admin settings page. Owner-only (zone_auth gated)."""
     settings = load_settings()
     # Onboarding is one-time: once finished, send already-onboarded owners
     # straight to login instead.
@@ -1180,46 +1184,69 @@ def community_onboarding():
         return _render_onboarding(server, room_alias)
 
     # --- Finish onboarding: create the single owner account -------------------
+    # Onboarding only asks for a username. Most users chat via the built-in web
+    # client (auto-logged-in via SSO), so no password is entered here: we
+    # generate a strong random one for SSO to use. A user who wants to sign in
+    # from a third-party Matrix client sets a password later on the admin
+    # settings page (/_openhost/admin), which updates Synapse and the stored SSO
+    # password together.
     owner_username = (request.form.get("username") or "").strip().lower()
-    owner_password = request.form.get("password") or ""
+    owner_password = _generate_password()
     join_community = request.form.get("join_community") == "1"
     # Federation is enabled by default (no onboarding checkbox); it can still be
     # turned off later from the admin console.
     enable_federation = True
 
+    # Validate the username up front (create_account also validates, but we may
+    # take the "already exists" branch which skips it).
+    if (
+        not owner_username
+        or not _USERNAME_RE.match(owner_username)
+        or owner_username.startswith("_")
+    ):
+        return _render_onboarding(
+            server, room_alias, suggested=owner_username,
+            error="Invalid username. Use lowercase letters, numbers, and "
+            ". _ = - (not starting with _).",
+        )
+
     # Create the owner's Matrix account (single account). If the name is already
-    # taken, we require the matching password (so re-running with the same
-    # credentials is fine, but you can't hijack an existing account).
+    # taken (e.g. a resubmit or an existing account), reset its password to the
+    # freshly generated one via the admin API so SSO auto-login works. There is
+    # no password prompt to match against anymore, and this path is owner-only
+    # (zone_auth gates onboarding), so resetting is safe.
     existing = []
     try:
         existing = list_user_localparts()
     except SSOError:
         existing = []
     if owner_username in existing:
-        # Account already exists (e.g. resubmit): verify the password matches.
         try:
+            admin_token = _get_admin_token()
+            # Resolve the server name properly (the page-level `server` may be
+            # empty if it wasn't readable at render time). list_user_localparts
+            # above already succeeded, so Synapse is reachable here.
+            user_id = f"@{owner_username}:{_server_name()}"
+            # logout_devices=False so we don't kill any existing chat sessions.
             _synapse_request(
-                "POST",
-                "/_matrix/client/v3/login",
-                body={
-                    "type": "m.login.password",
-                    "identifier": {"type": "m.id.user", "user": owner_username},
-                    "password": owner_password,
-                    "initial_device_display_name": "OpenHost onboarding check",
-                },
+                "PUT",
+                f"/_synapse/admin/v2/users/{urllib.parse.quote(user_id, safe='')}",
+                token=admin_token,
+                body={"password": owner_password, "logout_devices": False},
             )
-        except SSOError:
+        except SSOError as exc:
+            app.logger.error("onboarding: could not reset existing account password: %s", exc)
             return _render_onboarding(
                 server, room_alias, suggested=owner_username,
-                error=f"@{owner_username} already exists and the password doesn't match.",
+                error="Could not set up that account. Check the app logs.",
             )
     else:
         error = create_account(owner_username, owner_password, admin=True)
         if error:
             return _render_onboarding(server, room_alias, suggested=owner_username, error=error)
 
-    # Persist the chosen password (0600) so SSO auto-login reuses it instead of
-    # rotating it, keeping the password working from other Matrix clients too.
+    # Persist the generated password (0600) so SSO auto-login reuses it instead
+    # of rotating it on every load.
     _store_owner_password(owner_username, owner_password)
 
     settings = load_settings()

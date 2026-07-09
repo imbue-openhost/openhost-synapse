@@ -7,9 +7,12 @@ Durable, project-level decisions. Keep these in mind for future changes.
 - Users must never have to manually restart the app. Settings that need a Synapse
   restart (federation, registration) are applied by the app restarting itself
   (start.sh supervises Synapse; podman's restart policy relaunches the container).
-- Single account model: onboarding sets exactly one owner account (username +
-  password). It is SSO'd into the web client and the same password works from
-  third-party Matrix clients. No multi-account creation/management.
+- Single account model: onboarding sets exactly one owner account (username
+  only, no password prompt). It is SSO'd into the web client automatically.
+  Onboarding generates a random password for SSO's internal use; a user-chosen
+  password for third-party Matrix clients is set separately on the admin
+  settings page (/_openhost/admin), which updates Synapse and the stored SSO
+  password together. No multi-account creation/management.
 - The onboarding default username comes from the OpenHost owner username
   (OPENHOST_OWNER_USERNAME), sanitized to a valid Matrix localpart.
 - Onboarding is minimal (little reading). Detailed explanations live on a separate
