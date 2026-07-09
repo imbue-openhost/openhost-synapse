@@ -31,6 +31,11 @@ RUN git apply --check cinny-suppress-connecting-banner.patch && \
 # Build the static SPA. Guard against a future refactor silently regressing the
 # patch: the built bundle must NOT contain the "Connecting..." banner string,
 # and MUST still contain the error banners we intentionally keep.
+#
+# Cinny's vite build is memory hungry and the default V8 old-space limit
+# (~2 GB) causes an out-of-memory abort during "rendering chunks" on
+# memory-constrained build hosts. Raise the heap limit so the build completes.
+ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN npm ci && npm run build && \
     if grep -rq 'Connecting\.\.\.' dist/assets/*.js; then \
         echo "ERROR: 'Connecting...' banner still present in built Cinny; patch did not take effect" >&2; \
