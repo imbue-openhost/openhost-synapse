@@ -700,12 +700,15 @@ _sso_lock = threading.Lock()
 
 
 def _store_owner_password(username: str, password: str) -> None:
-    """Persist the owner account's password in the 0600 SSO state file so SSO can
-    log in as them WITHOUT rotating (overwriting) the password they chose.
+    """Persist the owner account's current password in the 0600 SSO state file
+    so SSO can log in as them WITHOUT rotating (overwriting) it on every load.
 
-    This is what lets the owner keep using the username/password they set during
-    onboarding from other clients (e.g. a phone) — SSO reuses that exact password
-    rather than replacing it with a random one on every auto-login.
+    The stored password is the app-generated random one set at onboarding
+    (the owner never sees it), or — once the owner sets a password on the admin
+    settings page for third-party Matrix clients — that chosen password. In both
+    cases SSO reuses whatever is stored here for auto-login rather than replacing
+    it with a fresh random value each time; storing the admin-chosen password is
+    what lets the same username/password work from other clients (e.g. a phone).
     """
     state = _load_sso_state()
     owners = state.get("owner_passwords") or {}
@@ -728,11 +731,13 @@ def sso_login_for_owner(username: str) -> dict:
     with an empty device_id is rejected and the client bounces to its own login
     screen.
 
-    Preferred path: log in with the owner's stored password (chosen during
-    onboarding), so their password is never rotated and keeps working from other
-    clients. Only if no stored password exists (older instances that predate this
-    behaviour) do we fall back to setting a fresh ephemeral password via the admin
-    API — and we persist that so subsequent logins stop rotating too.
+    Preferred path: log in with the owner's stored password, so it is never
+    rotated. The stored password is the app-generated random one from onboarding,
+    or the password the owner later set on the admin settings page (which then
+    also works from third-party Matrix clients). Only if no stored password
+    exists (older instances that predate this behaviour) do we fall back to
+    setting a fresh ephemeral password via the admin API — and we persist that so
+    subsequent logins stop rotating too.
 
     Serialized under _sso_lock so concurrent logins can't race on the password.
 
