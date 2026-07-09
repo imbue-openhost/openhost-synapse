@@ -13,13 +13,25 @@
 # ---------------------------------------------------------------------------
 FROM node:22-bookworm AS cinny-builder
 
-# Pin the bundled web client (Cinny) version so builds are reproducible. Keep
-# this in sync with the patch in cinny-suppress-connecting-banner.patch; the
-# build fails loudly if the patch no longer applies (e.g. after a version bump).
+# Pin the bundled web client (Cinny) so builds are reproducible. CINNY_VERSION
+# is the human-readable release tag; CINNY_COMMIT_SHA is the immutable commit it
+# must resolve to. A git tag is a mutable ref (it can be force-moved upstream),
+# so we clone the tag for readability but then hard-verify the checked-out
+# commit against the pinned SHA and abort the build on any mismatch. Keep both
+# in sync with each other and with cinny-suppress-connecting-banner.patch; the
+# build also fails loudly if the patch no longer applies (e.g. a version bump).
 ARG CINNY_VERSION=v4.12.3
+ARG CINNY_COMMIT_SHA=69515e8e81d082a7b0609247e296391d3d6f1e38
 
 WORKDIR /build
-RUN git clone --depth 1 --branch "${CINNY_VERSION}" https://github.com/cinnyapp/cinny.git .
+RUN git clone --depth 1 --branch "${CINNY_VERSION}" https://github.com/cinnyapp/cinny.git . && \
+    HEAD_SHA="$(git rev-parse HEAD)" && \
+    if [ "$HEAD_SHA" != "$CINNY_COMMIT_SHA" ]; then \
+        echo "ERROR: Cinny ${CINNY_VERSION} resolved to ${HEAD_SHA}, expected ${CINNY_COMMIT_SHA}." >&2; \
+        echo "       The upstream tag may have moved. Verify and update CINNY_COMMIT_SHA." >&2; \
+        exit 1; \
+    fi && \
+    echo "Cinny pinned commit verified: ${HEAD_SHA}"
 
 # Apply the OpenHost patch. `git apply --check` first so a version bump that
 # invalidates the patch fails the build here with a clear error instead of

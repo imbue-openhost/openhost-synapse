@@ -36,6 +36,12 @@ def cinny_version_from_dockerfile() -> str:
     return m.group(1)
 
 
+def cinny_commit_sha_from_dockerfile() -> str:
+    m = re.search(r"ARG\s+CINNY_COMMIT_SHA=([0-9a-f]+)", DOCKERFILE)
+    assert m, "CINNY_COMMIT_SHA ARG not found in Dockerfile"
+    return m.group(1)
+
+
 class TestCinnyVersionPin(unittest.TestCase):
     def test_dockerfile_pins_a_version(self):
         ver = cinny_version_from_dockerfile()
@@ -44,6 +50,31 @@ class TestCinnyVersionPin(unittest.TestCase):
     def test_single_version_arg(self):
         # Exactly one CINNY_VERSION ARG so there is a single source of truth.
         self.assertEqual(len(re.findall(r"ARG\s+CINNY_VERSION=", DOCKERFILE)), 1)
+
+    def test_dockerfile_pins_a_commit_sha(self):
+        # A tag is mutable; the commit SHA is the immutable content pin.
+        sha = cinny_commit_sha_from_dockerfile()
+        self.assertRegex(sha, r"^[0-9a-f]{40}$", "expected a full 40-hex commit SHA")
+
+    def test_single_commit_sha_arg(self):
+        self.assertEqual(len(re.findall(r"ARG\s+CINNY_COMMIT_SHA=", DOCKERFILE)), 1)
+
+    def test_build_verifies_commit_sha_and_aborts_on_mismatch(self):
+        # The clone step must compare HEAD against the pinned SHA and exit non-zero
+        # on mismatch, so a moved upstream tag fails the build instead of silently
+        # shipping different code.
+        self.assertIn("git rev-parse HEAD", DOCKERFILE)
+        self.assertRegex(
+            DOCKERFILE,
+            r'if \[ "\$HEAD_SHA" != "\$CINNY_COMMIT_SHA" \]; then',
+        )
+        # The mismatch branch must abort the build.
+        mismatch = re.search(
+            r'if \[ "\$HEAD_SHA" != "\$CINNY_COMMIT_SHA" \]; then.*?exit 1',
+            DOCKERFILE,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(mismatch, "SHA mismatch must 'exit 1'")
 
 
 class TestPatchIntegrity(unittest.TestCase):
@@ -247,6 +278,51 @@ class TestPatchAppliesToPinnedTag(unittest.TestCase):
             cwd=src, capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_checkout_matches_pinned_sha(self):
+        src = os.environ.get("CINNY_SRC_DIR")
+        if not src or not Path(src).is_dir():
+            self.skipTest("CINNY_SRC_DIR not set to a Cinny checkout")
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=src, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            cinny_commit_sha_from_dockerfile(),
+            "CINNY_SRC_DIR checkout does not match the pinned CINNY_COMMIT_SHA",
+        )
+
+
+class TestPinnedTagResolvesToSha(unittest.TestCase):
+    """Network-gated: confirm the upstream tag still resolves to the pinned SHA.
+
+    Opt in with RUN_NETWORK_TESTS=1. This catches a tag that has been moved
+    upstream (the exact scenario the SHA pin defends against). Skipped by
+    default so the fast/hermetic suite never depends on network access.
+    """
+
+    def test_tag_points_at_pinned_commit(self):
+        if os.environ.get("RUN_NETWORK_TESTS") != "1":
+            self.skipTest("set RUN_NETWORK_TESTS=1 to query upstream Cinny tags")
+        version = cinny_version_from_dockerfile()
+        expected = cinny_commit_sha_from_dockerfile()
+        result = subprocess.run(
+            ["git", "ls-remote", "--tags",
+             "https://github.com/cinnyapp/cinny.git", version],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # ls-remote prints "<sha>\trefs/tags/<version>" (and possibly a "^{}"
+        # peeled line for annotated tags). Accept either the tag object or its
+        # peeled commit matching the pin.
+        shas = {line.split("\t")[0] for line in result.stdout.strip().splitlines()}
+        self.assertIn(
+            expected, shas,
+            f"upstream tag {version} no longer resolves to pinned {expected}; "
+            f"got {shas}",
+        )
 
 
 if __name__ == "__main__":

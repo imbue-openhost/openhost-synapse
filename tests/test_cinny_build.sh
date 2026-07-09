@@ -26,7 +26,12 @@ if [ -z "$CINNY_VERSION" ]; then
     echo "FAIL: could not read CINNY_VERSION from Dockerfile" >&2
     exit 1
 fi
-echo "Cinny version pinned in Dockerfile: $CINNY_VERSION"
+CINNY_COMMIT_SHA="$(sed -n 's/.*ARG[[:space:]]\+CINNY_COMMIT_SHA=\([0-9a-f]*\).*/\1/p' "$DOCKERFILE" | head -1)"
+if [ -z "$CINNY_COMMIT_SHA" ]; then
+    echo "FAIL: could not read CINNY_COMMIT_SHA from Dockerfile" >&2
+    exit 1
+fi
+echo "Cinny pinned in Dockerfile: $CINNY_VERSION ($CINNY_COMMIT_SHA)"
 
 # Match the Dockerfile's heap bump so we exercise the same build path.
 HEAP="$(sed -n 's/.*max-old-space-size=\([0-9]*\).*/\1/p' "$DOCKERFILE" | head -1)"
@@ -40,6 +45,14 @@ trap cleanup EXIT
 echo "Cloning Cinny $CINNY_VERSION ..."
 git clone --depth 1 --branch "$CINNY_VERSION" https://github.com/cinnyapp/cinny.git "$WORK/cinny"
 cd "$WORK/cinny"
+
+# Verify the tag resolves to the pinned immutable commit (a tag can be moved).
+HEAD_SHA="$(git rev-parse HEAD)"
+if [ "$HEAD_SHA" != "$CINNY_COMMIT_SHA" ]; then
+    echo "FAIL: $CINNY_VERSION resolved to $HEAD_SHA, expected $CINNY_COMMIT_SHA" >&2
+    exit 1
+fi
+echo "PASS: pinned commit verified ($HEAD_SHA)"
 
 echo "Checking patch applies cleanly ..."
 git apply --check "$PATCH"
