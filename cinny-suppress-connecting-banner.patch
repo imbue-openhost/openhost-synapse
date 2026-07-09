@@ -1,0 +1,42 @@
+diff --git a/src/app/pages/client/SyncStatus.tsx b/src/app/pages/client/SyncStatus.tsx
+index 9cd4b0b..cf701f3 100644
+--- a/src/app/pages/client/SyncStatus.tsx
++++ b/src/app/pages/client/SyncStatus.tsx
+@@ -30,26 +30,17 @@ export function SyncStatus({ mx }: SyncStatusProps) {
+     }, [])
+   );
+ 
+-  if (
+-    (stateData.current === SyncState.Prepared ||
+-      stateData.current === SyncState.Syncing ||
+-      stateData.current === SyncState.Catchup) &&
+-    stateData.previous !== SyncState.Syncing
+-  ) {
+-    return (
+-      <Box direction="Column" shrink="No">
+-        <Box
+-          className={ContainerColor({ variant: 'Success' })}
+-          style={{ padding: `${config.space.S100} 0` }}
+-          alignItems="Center"
+-          justifyContent="Center"
+-        >
+-          <Text size="L400">Connecting...</Text>
+-        </Box>
+-        <Line variant="Success" size="300" />
+-      </Box>
+-    );
+-  }
++  // OpenHost patch: suppress the transient green "Connecting..." banner.
++  //
++  // matrix-js-sdk shows an active sync state (Prepared/Syncing/Catchup with a
++  // non-Syncing previous state) on every normal startup, and only clears it on
++  // the first steady Syncing->Syncing transition. On a personal homeserver that
++  // first long-poll holds open for the full /sync timeout, so the banner sits
++  // at the top of the screen for the whole poll window (tens of seconds) on an
++  // otherwise healthy connection. It is pure noise for our single-user setup.
++  //
++  // The genuinely useful states are kept: "Reconnecting..." (yellow) and
++  // "Connection Lost!" (red) still surface real connectivity problems below.
+ 
+   if (stateData.current === SyncState.Reconnecting) {
+     return (

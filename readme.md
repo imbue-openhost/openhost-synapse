@@ -15,6 +15,11 @@ The bundled [Cinny](https://cinny.in) web client is served at the app's URL,
 pinned to this homeserver (custom homeservers disabled). It's always available;
 there is no toggle to enable it.
 
+The client is built from source at image build time (rather than downloading the
+prebuilt release) so we can apply a small patch that suppresses the transient
+green "Connecting..." banner. See "Web client build and the Connecting banner"
+below.
+
 - The OpenHost **owner is auto-logged-in** via SSO: opening the app with no
   existing session runs a short first-run **onboarding** flow. Onboarding is a
   single account: you pick one username and password, and choose whether to join
@@ -183,7 +188,8 @@ To change federation or registration settings, use the admin UI. Direct edits to
 
 ## Files
 
-- `Dockerfile` -- extends the official Synapse image with Caddy, Flask, and the bundled Cinny web client
+- `Dockerfile` -- builds the patched Cinny web client in a `node` builder stage, then extends the official Synapse image with Caddy, Flask, and that bundled client
+- `cinny-suppress-connecting-banner.patch` -- source patch applied to Cinny at build time to suppress the transient "Connecting..." banner (see below)
 - `start.sh` -- generates config on first boot, applies settings from `openhost_settings.json` on every boot, renders the Cinny config, and supervises Caddy, the admin UI, and Synapse (exits to trigger an automatic restart when requested)
 - `Caddyfile.template` -- Caddy config template; serves the Cinny client at the root, routes `/_openhost/*` to the admin/onboarding UI, and proxies `/_matrix` + `/_synapse` to Synapse. It also caps the Matrix `/sync` long-poll `timeout` to 20s (see "Sync long-poll cap" below).
 - `admin.py` -- Flask app serving the admin UI, onboarding, and owner SSO on port 8009
@@ -195,3 +201,11 @@ To change federation or registration settings, use the admin UI. Direct edits to
 Matrix clients keep their session alive by long-polling `GET /_matrix/client/*/sync?timeout=<ms>` (matrix-js-sdk/Cinny default 30000ms). Synapse holds that request open for the requested duration. The OpenHost router proxies app requests with a ~30s read timeout, so a sync that holds the full ~30s is cut off and the client receives `504 App timed out`, which it surfaces as an intermittent disconnection.
 
 To avoid this, the Caddyfile rewrites the client-requested `timeout` on `/sync` requests down to 20000ms (comfortably under the router's ~30s) so Synapse always responds first. Only requests explicitly asking for >= 25000ms are rewritten; smaller values and the initial `timeout=0` sync pass through untouched.
+
+## Web client build and the Connecting banner
+
+The bundled Cinny client is compiled from source in a `node` builder stage in the `Dockerfile` (pinned to `CINNY_VERSION`), and `cinny-suppress-connecting-banner.patch` is applied before `npm run build`.
+
+The patch removes the transient green "Connecting..." banner that Cinny (via matrix-js-sdk) shows at the top of the screen. matrix-js-sdk reports an active sync state (`Prepared`/`Syncing`/`Catchup` with a non-`Syncing` previous state) on every normal startup and only clears the banner once the first steady `Syncing -> Syncing` transition occurs. On a personal homeserver the first `/sync` long-poll holds open for the full poll window (see the sync long-poll cap above), so the banner lingers at the top of the screen for tens of seconds even though the connection is healthy. The patch suppresses that green banner while keeping the genuinely useful "Reconnecting..." (yellow) and "Connection Lost!" (red) banners for real connectivity problems.
+
+The build guards against silent regressions: `git apply --check` fails the build if the patch no longer applies (e.g. after a `CINNY_VERSION` bump), and a post-build check fails if the "Connecting..." string is still present or if the error banners were removed. If a version bump breaks the patch, regenerate it against the new tag.
