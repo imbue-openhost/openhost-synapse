@@ -90,8 +90,10 @@ class TestGuardStatic(unittest.TestCase):
     def test_guard_targets_sso_endpoint(self):
         self.assertIn("/_openhost/community/login", GUARD_JS)
 
-    def test_guard_is_not_path_restricted_to_root(self):
-        # Guard must NOT gate on being exactly at "/" anymore; that was the bug.
+    def test_guard_fires_on_any_path(self):
+        # The guard must run on every app path, so it must not gate on the
+        # location being exactly "/". (Cinny is an SPA served with an
+        # index.html fallback, so sub-paths boot session-less too.)
         self.assertNotIn('location.pathname==="/"', GUARD_JS.replace(" ", ""))
 
     def test_guard_injected_idempotently(self):
