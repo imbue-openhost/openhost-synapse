@@ -75,7 +75,7 @@ Implementation notes:
 ## How it works
 
 On first boot, the container:
-1. Generates a `homeserver.yaml` config with the server name derived from OpenHost environment variables (`<app_name>.<zone_domain>`, e.g. `synapse.andrew.host.imbue.com`)
+1. Generates a `homeserver.yaml` config with the server name derived from OpenHost environment variables (`<app_name>.<zone_domain>`, e.g. `community-chat.andrew.host.imbue.com`)
 2. Generates signing keys
 3. Creates `openhost_settings.json` with default settings (federation enabled, open registration enabled)
 4. Applies settings from `openhost_settings.json` to `homeserver.yaml`
@@ -87,7 +87,7 @@ On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` 
 
 ## Admin UI
 
-The chat account, federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://synapse.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
+The chat account, federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://community-chat.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
 
 The UI provides:
 
@@ -145,12 +145,12 @@ The first user to register can be promoted to admin via the Synapse admin API or
 Deploy via the OpenHost dashboard or CLI:
 
 ```bash
-oh app deploy https://github.com/imbue-openhost/openhost-synapse --wait
+oh app deploy https://github.com/imbue-openhost/openhost-community-chat --wait
 ```
 
-The app will be available at `synapse.<zone_domain>` (e.g. `synapse.andrew.host.imbue.com`).
+The app will be available at `community-chat.<zone_domain>` (e.g. `community-chat.andrew.host.imbue.com`).
 
-Connect with any Matrix client (Element, FluffyChat, etc.) using your server URL as the homeserver. User IDs will look like `@user:synapse.<zone_domain>`.
+Connect with any Matrix client (Element, FluffyChat, etc.) using your server URL as the homeserver. User IDs will look like `@user:community-chat.<zone_domain>`.
 
 ## Data
 
