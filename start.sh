@@ -36,14 +36,14 @@ rm -f "$RESTART_SENTINEL" 2>/dev/null || true
 # "join the community" flow. A space is a room whose child rooms are declared via
 # m.space.child; joining it lets the client browse its rooms. Lives on the
 # OpenHost community hub homeserver and is joined over federation. Overridable per
-# instance via OPENHOST_COMMUNITY_ROOM_ALIAS or the admin console.
+# instance via OPENHOST_COMMUNITY_ROOM_ALIAS (seeded on first boot).
 DEFAULT_COMMUNITY_ROOM_ALIAS="#openhost-community:matrix.openhost.imbue.com"
 
 # The alias to seed on first boot: an operator-provided env override wins,
 # otherwise the hardcoded canonical default. Used both when creating the initial
 # settings file below and when backfilling older settings files that lack the
-# key. After first boot the value in the settings file is authoritative (the
-# admin console can change or clear it), so this only ever seeds an absent key.
+# key. After first boot the value in the settings file is authoritative, so this
+# only ever seeds an absent key.
 COMMUNITY_ROOM_ALIAS_SEED="${OPENHOST_COMMUNITY_ROOM_ALIAS:-$DEFAULT_COMMUNITY_ROOM_ALIAS}"
 
 if [ ! -f "$SETTINGS_FILE" ]; then
@@ -83,17 +83,16 @@ except Exception as e:
 
 # Backfill the community room alias ONLY when the settings file predates the
 # hardcoded default and has no alias key at all (older instances created before
-# this default existed). We must NOT touch a key that is present-but-empty: the
-# admin console lets an operator deliberately blank the alias to disable the
-# community-join opt-in ("Leave blank to disable"), and re-populating it would
-# silently re-enable a feature they turned off. We also must NOT overwrite a
-# value already present, so an admin-chosen alias is never clobbered on reboot.
+# this default existed). We must NOT touch a key that is present-but-empty: an
+# empty alias intentionally disables the community-join opt-in, and re-populating
+# it would silently re-enable a feature that was turned off. We also must NOT
+# overwrite a value already present, so a configured alias is never clobbered on
+# reboot.
 #
 # OPENHOST_COMMUNITY_ROOM_ALIAS, if set, seeds the alias only when the key is
-# absent (a provisioning-time default), for the same reason — it is not a
-# per-reboot enforcer that would override later admin choices. (On a fresh
-# instance the key is already written above with this same seed value, so this
-# block only fires for older settings files that predate the key.)
+# absent (a provisioning-time default), for the same reason. (On a fresh instance
+# the key is already written above with this same seed value, so this block only
+# fires for older settings files that predate the key.)
 python3 - "$SETTINGS_FILE" "$COMMUNITY_ROOM_ALIAS_SEED" <<'PYEOF'
 import json, sys
 path, seed = sys.argv[1], sys.argv[2]
