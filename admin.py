@@ -70,6 +70,10 @@ DEFAULTS = {
     "open_registration": True,
     "community_onboarded": False,
     "community_joined": False,
+    # The room id of the community space, resolved and stored once the join
+    # succeeds. Used to land the web client on the space by default. Empty until
+    # a join completes.
+    "community_room_id": "",
     # The alias of the space the "join the community" flow joins. Defaults to the
     # canonical OpenHost community space; can be overridden.
     "community_room_alias": DEFAULT_COMMUNITY_ROOM_ALIAS,
@@ -925,6 +929,25 @@ def _owner_matrix_username() -> str:
     return settings.get("community_username") or _default_account_username()
 
 
+def _community_landing_path(settings: dict) -> str:
+    """Path the web client should open on after SSO.
+
+    If the owner has joined the community space, land on that space's lobby so
+    they open onto the community rather than the empty Home view. The space is
+    referenced by its resolved room id when available (stable), falling back to
+    the configured alias. Cinny's space route is /<spaceIdOrAlias>/lobby/ with
+    the id/alias percent-encoded as a single path segment. Returns "/" when
+    there is no joined space to land on.
+    """
+    if not settings.get("community_joined"):
+        return "/"
+    space_ref = settings.get("community_room_id") or settings.get("community_room_alias") or ""
+    if not space_ref:
+        return "/"
+    # Encode as one path segment (so ! # : in room ids/aliases are preserved).
+    return "/" + urllib.parse.quote(space_ref, safe="") + "/lobby/"
+
+
 SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Signing in...</title></head>
 <body style="background:#0f1117;color:#e2e8f0;font-family:sans-serif;text-align:center;padding-top:20vh">
@@ -935,6 +958,10 @@ SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
   var deviceId = {{ device_id|tojson }};
   var userId = {{ user_id|tojson }};
   var hsBase = {{ hs_base_url|tojson }};
+  // Where to land the client after sign-in. When the owner has joined the
+  // community space this is that space's lobby, so the user opens onto the
+  // community instead of the empty Home view; otherwise it's the app root.
+  var landingPath = {{ landing_path|tojson }};
 
   try {
     localStorage.setItem("cinny_access_token", token);
@@ -950,7 +977,7 @@ SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
   // for a few seconds; fall back to loading anyway so we never get stuck here.
   var attempts = 0;
   var maxAttempts = 20;   // ~10s at 500ms
-  function go() { window.location.replace("/"); }
+  function go() { window.location.replace(landingPath || "/"); }
   function check() {
     attempts++;
     fetch(hsBase + "/_matrix/client/v3/account/whoami", {
@@ -1325,6 +1352,7 @@ def community_login():
         device_id=session["device_id"],
         user_id=session["user_id"],
         hs_base_url=hs_base_url,
+        landing_path=_community_landing_path(settings),
     )
 
 
@@ -1366,6 +1394,11 @@ def _complete_pending_community_join() -> None:
             settings = load_settings()
             settings["community_joined"] = True
             settings["community_join_pending"] = False
+            # Persist the resolved room_id so the web client can land the user on
+            # the community space by default (a stable id beats the alias, which
+            # can change). Only store a real room id.
+            if room_id:
+                settings["community_room_id"] = room_id
             save_settings(settings)
             app.logger.info("joined community room %s (%s)", room_alias, room_id)
             return
