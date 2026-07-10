@@ -82,6 +82,23 @@ class TestGuardBehavior(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIsNone(run_guard(path, "syt_sometoken"))
 
+    def test_deep_and_nested_paths_redirect(self):
+        # Deeper nesting and trailing slashes still redirect when session-less.
+        for path in [
+            "/inbox/notifications/",
+            "/direct/create",
+            "/room/!abc:server/settings",
+            "/spaces/!s:server",
+            "/login",  # even Cinny's own login route should bounce to SSO
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual(run_guard(path, None), self.SSO)
+
+    def test_token_present_on_nested_paths_does_not_redirect(self):
+        for path in ["/inbox/notifications/", "/room/!abc:server/settings"]:
+            with self.subTest(path=path):
+                self.assertIsNone(run_guard(path, "syt_sometoken"))
+
 
 class TestGuardStatic(unittest.TestCase):
     def test_guard_checks_the_session_key(self):
