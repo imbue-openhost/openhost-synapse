@@ -59,8 +59,8 @@ SSO_ADMIN_USER = "openhost-sso-admin"
 # child rooms are declared via m.space.child state; joining it gives the client
 # the space and lets the user browse/enter its rooms. It lives on the OpenHost
 # community hub homeserver and is referenced only by this alias string — the hub
-# is separate infrastructure. Overridable per instance via the admin console or
-# the OPENHOST_COMMUNITY_ROOM_ALIAS env var.
+# is separate infrastructure. Overridable per instance via the
+# OPENHOST_COMMUNITY_ROOM_ALIAS env var (seeded on first boot).
 DEFAULT_COMMUNITY_ROOM_ALIAS = "#openhost-community:matrix.openhost.imbue.com"
 
 DEFAULTS = {
@@ -471,17 +471,6 @@ TEMPLATE = """<!DOCTYPE html>
             <span class="slider"></span>
           </label>
         </div>
-        <div style="margin-top:1rem">
-          <label for="community_room_alias" style="display:block;font-size:.85rem;color:#94a3b8;margin-bottom:.35rem">
-            Community space alias (optional)</label>
-          <input type="text" id="community_room_alias" name="community_room_alias"
-            value="{{ settings.community_room_alias or '' }}"
-            placeholder="#openhost-community:matrix.openhost.imbue.com"
-            style="width:100%;padding:.5rem;border-radius:.4rem;border:1px solid #2d3348;background:#0d1117;color:#e2e8f0">
-          <p style="font-size:.75rem;color:#64748b;margin-top:.35rem">
-            The space (or room) the onboarding "join the community" opt-in will
-            join. Leave blank to disable the community-join option.</p>
-        </div>
       </div>
 
       <button type="submit" class="save-btn">Save &amp; Apply</button>
@@ -857,8 +846,9 @@ def save():
     prev = load_settings()
     settings["federation_enabled"] = request.form.get("federation_enabled") == "1"
     settings["open_registration"] = request.form.get("open_registration") == "1"
-    if "community_room_alias" in request.form:
-        settings["community_room_alias"] = request.form.get("community_room_alias", "").strip()
+    # community_room_alias is no longer editable from the admin UI; it is seeded
+    # on first boot (default or OPENHOST_COMMUNITY_ROOM_ALIAS) and preserved via
+    # the load_settings() merge above.
     save_settings(settings)
 
     yaml_error = None
