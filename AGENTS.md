@@ -1,4 +1,4 @@
-# Design notes for openhost-synapse
+# Design notes for openhost-community-chat
 
 Durable, project-level decisions. Keep these in mind for future changes.
 

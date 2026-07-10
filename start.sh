@@ -151,7 +151,7 @@ fi
 
 # Derive server name and public URL from OpenHost environment variables
 if [ -n "$OPENHOST_ZONE_DOMAIN" ]; then
-    APP_SUBDOMAIN="${OPENHOST_APP_NAME:-synapse}"
+    APP_SUBDOMAIN="${OPENHOST_APP_NAME:-community-chat}"
     SERVER_NAME="${APP_SUBDOMAIN}.${OPENHOST_ZONE_DOMAIN}"
 
     case "$OPENHOST_ZONE_DOMAIN" in
