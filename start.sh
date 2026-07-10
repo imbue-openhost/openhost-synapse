@@ -269,9 +269,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # Web client (Cinny) — always served at the app root. The bundled client is
-# pinned to this homeserver. The OpenHost owner is auto-logged-in via SSO on
-# first open (a first-run guard bounces a session-less client to the SSO/
-# onboarding endpoint). Matrix APIs stay under /_matrix and /_synapse.
+# pinned to this homeserver. The OpenHost owner is auto-logged-in via SSO
+# whenever the client has no session (a first-run guard bounces a session-less
+# client to the SSO/onboarding endpoint, from any app path). Matrix APIs stay
+# under /_matrix and /_synapse.
 # ---------------------------------------------------------------------------
 WEBROOT="/app/webclient"
 if [ -d "$WEBROOT" ]; then
@@ -289,10 +290,19 @@ if [ -d "$WEBROOT" ]; then
     fi
     # Inject a first-run guard into index.html: if the client has no session yet,
     # bounce to the OpenHost SSO/onboarding endpoint. Idempotent (only injects
-    # once). This is what makes the owner hit onboarding on first open without
-    # having to serve Cinny from a subpath.
+    # once). This is what makes an unauthenticated visitor hit the SSO/onboarding
+    # flow instead of Cinny's own (dead-end, custom-homeservers-disabled) login
+    # screen.
+    #
+    # The guard fires on ANY app path, not just "/": Cinny is a single-page app
+    # served with an index.html fallback, so a deep link or a refresh on a
+    # sub-path (e.g. /inbox, /direct, a room URL) also boots session-less and
+    # would otherwise land on the login screen. The guard only ever runs inside
+    # this served index.html; the SSO endpoint (/_openhost/*) and the Matrix
+    # APIs (/_matrix, /_synapse) are handled by Caddy before the SPA, so
+    # redirecting to /_openhost/community/login cannot loop back through here.
     if [ -f "$WEBROOT/index.html" ] && ! grep -q "openhost-firstrun-guard" "$WEBROOT/index.html"; then
-        GUARD='<script id="openhost-firstrun-guard">if(!localStorage.getItem("cinny_access_token")&&location.pathname==="/"){location.replace("/_openhost/community/login");}</script>'
+        GUARD='<script id="openhost-firstrun-guard">if(!localStorage.getItem("cinny_access_token")){location.replace("/_openhost/community/login");}</script>'
         # Insert right after <head> so it runs before Cinny boots.
         python3 - "$WEBROOT/index.html" "$GUARD" <<'PYEOF'
 import sys
