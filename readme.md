@@ -113,11 +113,18 @@ this app restarts itself:
   runs containers with podman's `--restart=unless-stopped` policy, so the
   container is relaunched automatically and `start.sh` re-renders
   `homeserver.yaml` / the Caddyfile from the saved settings on the fresh boot.
-- The admin UI and onboarding pages poll for the app coming back up and continue
-  automatically, so the user never has to touch the OpenHost dashboard. Onboarding
-  stays on the same "Set up chat" screen while it restarts (submit is replaced by a
-  spinner); it polls Synapse and forwards to chat once the app is back, with no
-  separate transitional page.
+ - The admin UI and onboarding pages poll for the app coming back up and continue
+   automatically, so the user never has to touch the OpenHost dashboard. Onboarding
+   stays on the same "Set up chat" screen while it restarts (submit is replaced by a
+   spinner); it polls the onboarding status endpoint and forwards to chat once the
+   app is back, with no separate transitional page.
+ - When the owner opts into the community space, onboarding blocks the spinner
+   until that federated join has actually landed (the status endpoint reports
+   `done`), so the shared space is already visible when the chat client opens
+   rather than appearing a moment later. The background join is kept fast (polls
+   Synapse readiness at 1s and retries the federated join with a short backoff,
+   reusing one session across retries). If the join can't complete this boot it
+   is retried on the next boot, and the page forwards instead of hanging.
 
 Settings are stored in `$OPENHOST_APP_DATA_DIR/openhost_settings.json`:
 ```json
