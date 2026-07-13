@@ -1212,7 +1212,11 @@ def create_account(username: str, password: str, admin: bool = False) -> str | N
     except SSOError as exc:
         detail = str(exc)
         if "M_USER_IN_USE" in detail or "409" in detail:
-            return f"Username '{username}' is already taken."
+            # Deliberately does not echo the submitted username back into the
+            # message: the value is already visible in the form's username field,
+            # and keeping user-provided input out of the rendered error text keeps
+            # this off any reflected-XSS taint path.
+            return "That username is already taken. Choose another."
         app.logger.error("create_account: registration failed: %s", exc)
         return "Could not create account. Check the app logs."
     return None
