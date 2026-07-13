@@ -114,7 +114,10 @@ this app restarts itself:
   container is relaunched automatically and `start.sh` re-renders
   `homeserver.yaml` / the Caddyfile from the saved settings on the fresh boot.
 - The admin UI and onboarding pages poll for the app coming back up and continue
-  automatically, so the user never has to touch the OpenHost dashboard.
+  automatically, so the user never has to touch the OpenHost dashboard. Onboarding
+  stays on the same "Set up chat" screen while it restarts (submit is replaced by a
+  spinner); it polls Synapse and forwards to chat once the app is back, with no
+  separate transitional page.
 
 Settings are stored in `$OPENHOST_APP_DATA_DIR/openhost_settings.json`:
 ```json
