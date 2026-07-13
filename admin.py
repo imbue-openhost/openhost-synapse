@@ -1008,7 +1008,6 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
 
   <form id="onboarding-form" method="POST" action="/_openhost/community/onboarding">
-    <input type="hidden" name="action" value="finish">
     <div class="card">
       <div class="row">
         <div>
@@ -1090,7 +1089,10 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       btn.style.display = "none";
       saving.style.display = "flex";
 
-      fetch(form.action, {
+      // Use getAttribute("action"): a form control named "action" would
+      // otherwise clobber form.action (it returns that element, not the URL),
+      // sending the POST to a bogus path.
+      fetch(form.getAttribute("action"), {
         method: "POST",
         body: new FormData(form),
         headers: { "X-Requested-With": "fetch" }
