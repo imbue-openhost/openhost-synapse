@@ -992,9 +992,13 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   .consent input{margin-top:.2rem}
   .btn{display:block;width:100%;padding:.75rem;background:#6366f1;color:#fff;border:none;border-radius:.5rem;font-size:.95rem;font-weight:500;cursor:pointer;margin-top:1.25rem}
   .btn:hover{background:#4f46e5}
+  .btn:disabled{opacity:.7;cursor:default}
   .err{color:#f87171;font-size:.85rem;margin-top:.5rem}
   .row{display:flex;gap:.75rem;flex-wrap:wrap}
   .row>div{flex:1;min-width:150px}
+  .saving{display:flex;align-items:center;gap:.65rem;color:#cbd5e1;font-size:.9rem;margin-top:1.25rem;justify-content:center}
+  .spinner{width:18px;height:18px;border:2px solid #374151;border-top-color:#6366f1;border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
+  @keyframes spin{to{transform:rotate(360deg)}}
 </style></head>
 <body><div class="container">
   <h1>Set up chat</h1>
@@ -1003,7 +1007,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
 
-  <form method="POST" action="/_openhost/community/onboarding">
+  <form id="onboarding-form" method="POST" action="/_openhost/community/onboarding">
     <input type="hidden" name="action" value="finish">
     <div class="card">
       <div class="row">
@@ -1030,8 +1034,90 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
          <a href="/_openhost/community/help" style="color:#a5b4fc">Details</a>.</p>
     </div>
 
-    <button type="submit" class="btn">Finish &amp; open chat</button>
+    <button id="submit-btn" type="submit" class="btn"{% if saving %} style="display:none"{% endif %}>Finish &amp; open chat</button>
+    <div id="saving" class="saving"{% if not saving %} style="display:none"{% endif %}>
+      <span class="spinner"></span>
+      <span>Setting up chat and starting the server. This opens automatically...</span>
+    </div>
   </form>
+
+  <script>
+  (function () {
+    var form = document.getElementById("onboarding-form");
+    var btn = document.getElementById("submit-btn");
+    var saving = document.getElementById("saving");
+    if (!form) { return; }
+    var alreadySaving = {{ 'true' if saving else 'false' }};
+
+    // Submit onboarding via fetch so we stay on this screen with a spinner,
+    // then poll until the app finishes its automatic restart (to activate
+    // federation) and forward to the SSO login. This replaces the old
+    // transitional "Almost there" page.
+    var LOGIN_URL = "/_openhost/community/login";
+
+    function pollUntilUp() {
+      // The app restarts to apply federation; the admin server (which served
+      // this page) goes away and comes back. Poll Synapse's public versions
+      // endpoint (served through the router even during onboarding) and only
+      // forward once it responds, so we never land on a not-ready screen.
+      var attempts = 0;
+      var maxAttempts = 120;  // ~6 min at 3s
+      function ping() {
+        attempts++;
+        fetch("/_matrix/client/versions", { cache: "no-store" })
+          .then(function (r) {
+            if (r.ok) { window.location.replace(LOGIN_URL); }
+            else if (attempts < maxAttempts) { setTimeout(ping, 3000); }
+            else { window.location.replace(LOGIN_URL); }
+          })
+          .catch(function () {
+            if (attempts < maxAttempts) { setTimeout(ping, 3000); }
+            else { window.location.replace(LOGIN_URL); }
+          });
+      }
+      // Give the server a moment to begin restarting before polling so we don't
+      // immediately see the still-up (about-to-die) instance and forward early.
+      setTimeout(ping, 4000);
+    }
+
+    // Non-JS fallback path: the server already accepted onboarding and rendered
+    // this page in the saving state (the app is restarting). Just poll.
+    if (alreadySaving) { pollUntilUp(); return; }
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      btn.disabled = true;
+      btn.style.display = "none";
+      saving.style.display = "flex";
+
+      fetch(form.action, {
+        method: "POST",
+        body: new FormData(form),
+        headers: { "X-Requested-With": "fetch" }
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; });
+      }).then(function (data) {
+        if (data && data.error) {
+          // Validation / setup error: show it and re-enable the form.
+          saving.style.display = "none";
+          btn.style.display = "block";
+          btn.disabled = false;
+          var err = document.createElement("div");
+          err.className = "err";
+          err.textContent = data.error;
+          form.parentNode.insertBefore(err, form);
+          return;
+        }
+        // Onboarding succeeded and the app is restarting; poll then forward.
+        pollUntilUp();
+      }).catch(function () {
+        // Network hiccup (possibly the restart already began). Assume success
+        // and poll for the app to come back rather than stranding the user.
+        pollUntilUp();
+      });
+    });
+  })();
+  </script>
 </div></body></html>
 """
 
@@ -1085,41 +1171,6 @@ HELP_TEMPLATE = """<!DOCTYPE html>
 </div></body></html>
 """
 
-JOIN_PENDING_TEMPLATE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Almost there</title>
-<style>
-  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
-  .container{max-width:560px;margin:0 auto}
-  h1{color:#f8fafc;font-size:1.5rem}
-  .card{background:#1e2130;border:1px solid #2d3348;border-radius:.75rem;padding:1.5rem;margin-top:1rem}
-  p,li{color:#cbd5e1;line-height:1.55}
-  code{color:#a5b4fc}
-  a.btn{display:inline-block;margin-top:1rem;padding:.6rem 1rem;background:#6366f1;color:#fff;border-radius:.5rem;text-decoration:none}
-</style></head>
-<body><div class="container">
-  <h1>Almost there</h1>
-  <div class="card">
-    <p>The app is <strong>restarting automatically</strong> to turn on
-       federation. This page reconnects and opens chat on its own when it's
-       ready, no action needed.</p>
-    <a class="btn" href="/_openhost/community/login">Open chat</a>
-  </div>
-  <script>
-    // Poll until the app is back up after the automatic restart, then continue.
-    (function(){
-      function ping(){
-        fetch("/_matrix/client/versions",{cache:"no-store"})
-          .then(function(r){ if(r.ok){ location.replace("/_openhost/community/login"); } })
-          .catch(function(){});
-      }
-      setInterval(ping, 3000);
-    })();
-  </script>
-</div></body></html>
-"""
-
 # Matrix localpart grammar technically allows a wider set, but Synapse's default
 # user_id validation is stricter and '/' in particular breaks account creation and
 # URL handling. Restrict to the safe, portable subset.
@@ -1167,7 +1218,7 @@ def create_account(username: str, password: str, admin: bool = False) -> str | N
     return None
 
 
-def _render_onboarding(server, room_alias, *, error=None, suggested=None):
+def _render_onboarding(server, room_alias, *, error=None, suggested=None, saving=False):
     if suggested is None:
         suggested = _default_account_username()
     return render_template_string(
@@ -1176,7 +1227,25 @@ def _render_onboarding(server, room_alias, *, error=None, suggested=None):
         suggested=suggested,
         server_name=server,
         community_room_alias=room_alias,
+        saving=saving,
     )
+
+
+def _wants_json() -> bool:
+    """True when onboarding was submitted via the page's fetch() (JS enabled).
+
+    The client sets X-Requested-With: fetch. When JS is enabled we return JSON
+    so the page can stay put, show a spinner, and poll for the restart; when it
+    is not, we fall back to rendering full HTML pages.
+    """
+    return request.headers.get("X-Requested-With") == "fetch"
+
+
+def _onboarding_error(server, room_alias, *, suggested, error):
+    """Return an onboarding error as JSON (fetch path) or re-rendered HTML."""
+    if _wants_json():
+        return {"error": error}, 400
+    return _render_onboarding(server, room_alias, suggested=suggested, error=error)
 
 
 @app.route("/_openhost/community/onboarding", methods=["GET", "POST"])
@@ -1219,7 +1288,7 @@ def community_onboarding():
     # take the "already exists" branch which skips it).
     username_error = _validate_username(owner_username)
     if username_error:
-        return _render_onboarding(
+        return _onboarding_error(
             server, room_alias, suggested=owner_username, error=username_error,
         )
 
@@ -1247,14 +1316,14 @@ def community_onboarding():
             _admin_set_password(owner_username, owner_password, logout_devices=True)
         except SSOError as exc:
             app.logger.error("onboarding: could not reset existing account password: %s", exc)
-            return _render_onboarding(
+            return _onboarding_error(
                 server, room_alias, suggested=owner_username,
                 error="Could not set up that account. Check the app logs.",
             )
     else:
         error = create_account(owner_username, owner_password, admin=True)
         if error:
-            return _render_onboarding(server, room_alias, suggested=owner_username, error=error)
+            return _onboarding_error(server, room_alias, suggested=owner_username, error=error)
 
     # Persist the generated password (0600) so SSO auto-login reuses it instead
     # of rotating it on every load.
@@ -1279,13 +1348,19 @@ def community_onboarding():
         apply_settings_to_yaml(settings)
     except OSError as exc:
         app.logger.error("could not apply federation setting: %s", exc)
-        return _render_onboarding(
-            server, room_alias,
+        return _onboarding_error(
+            server, room_alias, suggested=owner_username,
             error="Set up chat, but could not turn on federation. You can "
             "retry from the admin console.",
         )
     request_app_restart()
-    return render_template_string(JOIN_PENDING_TEMPLATE)
+    # Success. The app is restarting to activate federation. The onboarding page
+    # stays put (spinner) and polls until it comes back, then forwards to login.
+    # JS path: return JSON so the page's fetch handler starts polling. Non-JS
+    # fallback: re-render this same screen in the saving state (self-polls).
+    if _wants_json():
+        return {"ok": True}
+    return _render_onboarding(server, room_alias, suggested=owner_username, saving=True)
 
 
 @app.route("/_openhost/community/help")
