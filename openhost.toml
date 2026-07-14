@@ -1,7 +1,7 @@
 [app]
-name = "synapse"
+name = "community-chat"
 version = "0.1.0"
-description = "Matrix Synapse homeserver - decentralized, encrypted communication"
+description = "Community chat for OpenHost: Matrix Synapse homeserver with a bundled web client, owner SSO, and one-click community-space join"
 
 [runtime.container]
 image = "Dockerfile"
