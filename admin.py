@@ -78,6 +78,10 @@ DEFAULTS = {
     "open_registration": True,
     "community_onboarded": False,
     "community_joined": False,
+    # The room id of the community space, resolved and stored once the join
+    # succeeds. Used to land the web client on the space by default. Empty until
+    # a join completes.
+    "community_room_id": "",
     # Set True by the onboarding POST when the owner opts into the community
     # space; cleared once the join lands (or if the owner opted out). The
     # onboarding page blocks its spinner on this being cleared.
@@ -948,15 +952,16 @@ def _join_room_with_token(token: str, room_alias: str, timeout: int = 60) -> str
     return resp.get("room_id", "")
 
 
-def _is_joined_to_space(token: str, room_alias: str) -> bool:
-    """True if the token's account is already a member of the space behind
-    ``room_alias``. Used to confirm a join actually landed even when the join
-    POST itself timed out on our side (Synapse can finish the federated join
-    after our HTTP client gives up).
+def _resolve_joined_room_id(token: str, room_alias: str) -> str:
+    """Return the room id of the space behind ``room_alias`` IF the token's
+    account is already a member, else "". Used to confirm a join actually landed
+    (even when the join POST timed out on our side — Synapse can finish the
+    federated join after our HTTP client gives up) and to capture the stable room
+    id for landing the web client on the space.
 
-    Resolves the alias to a room_id, then checks the account's joined rooms.
-    Any failure (alias not resolvable yet, request error) returns False so the
-    caller keeps retrying.
+    Resolves the alias to a room_id, then checks the account's joined rooms. Any
+    failure (alias not resolvable yet, request error) returns "" so the caller
+    keeps retrying.
     """
     try:
         quoted = urllib.parse.quote(room_alias, safe="")
@@ -965,11 +970,11 @@ def _is_joined_to_space(token: str, room_alias: str) -> bool:
         )
         room_id = resolved.get("room_id")
         if not room_id:
-            return False
+            return ""
         joined = _synapse_request("GET", "/_matrix/client/v3/joined_rooms", token=token, timeout=30)
-        return room_id in (joined.get("joined_rooms") or [])
+        return room_id if room_id in (joined.get("joined_rooms") or []) else ""
     except SSOError:
-        return False
+        return ""
 
 
 def _default_account_username() -> str:
@@ -993,6 +998,25 @@ def _owner_matrix_username() -> str:
     return settings.get("community_username") or _default_account_username()
 
 
+def _community_landing_path(settings: dict) -> str:
+    """Path the web client should open on after SSO.
+
+    If the owner has joined the community space, land on that space's lobby so
+    they open onto the community rather than the empty Home view. The space is
+    referenced by its resolved room id when available (stable), falling back to
+    the configured alias. Cinny's space route is /<spaceIdOrAlias>/lobby/ with
+    the id/alias percent-encoded as a single path segment. Returns "/" when
+    there is no joined space to land on.
+    """
+    if not settings.get("community_joined"):
+        return "/"
+    space_ref = settings.get("community_room_id") or settings.get("community_room_alias") or ""
+    if not space_ref:
+        return "/"
+    # Encode as one path segment (so ! # : in room ids/aliases are preserved).
+    return "/" + urllib.parse.quote(space_ref, safe="") + "/lobby/"
+
+
 SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Signing in...</title></head>
 <body style="background:#0f1117;color:#e2e8f0;font-family:sans-serif;text-align:center;padding-top:20vh">
@@ -1003,6 +1027,10 @@ SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
   var deviceId = {{ device_id|tojson }};
   var userId = {{ user_id|tojson }};
   var hsBase = {{ hs_base_url|tojson }};
+  // Where to land the client after sign-in. When the owner has joined the
+  // community space this is that space's lobby, so the user opens onto the
+  // community instead of the empty Home view; otherwise it's the app root.
+  var landingPath = {{ landing_path|tojson }};
 
   try {
     localStorage.setItem("cinny_access_token", token);
@@ -1018,7 +1046,7 @@ SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
   // for a few seconds; fall back to loading anyway so we never get stuck here.
   var attempts = 0;
   var maxAttempts = 20;   // ~10s at 500ms
-  function go() { window.location.replace("/"); }
+  function go() { window.location.replace(landingPath || "/"); }
   function check() {
     attempts++;
     fetch(hsBase + "/_matrix/client/v3/account/whoami", {
@@ -1534,7 +1562,21 @@ def community_login():
         device_id=session["device_id"],
         user_id=session["user_id"],
         hs_base_url=hs_base_url,
+        landing_path=_community_landing_path(settings),
     )
+
+
+@app.route("/_openhost/community/landing")
+def community_landing():
+    """Return the path the web client should open on, as JSON: {"path": "..."}.
+
+    Used by the index.html first-run guard so that a RETURNING visit to "/"
+    (where the client already has a session, so it never hits the SSO bootstrap)
+    still opens onto the community space lobby instead of Cinny's empty Home
+    view. The path is computed from live settings, so it reflects the joined
+    space (by stable room id, alias fallback) or "/" when none is joined.
+    """
+    return {"path": _community_landing_path(load_settings())}
 
 
 @app.route("/_openhost/community/onboarding/status")
@@ -1613,14 +1655,15 @@ def _wait_for_synapse(attempts: int = 120, interval: float = 1.0) -> bool:
     return False
 
 
-def _join_community_with_retries(username: str, room_alias: str) -> bool:
+def _join_community_with_retries(username: str, room_alias: str) -> str:
     """Join the owner to the community space, retrying through federation warmup.
 
-    Returns True once the account is confirmed a member of the space. After each
-    join attempt (and even if the attempt raised, e.g. our HTTP timeout fired
-    while Synapse kept going) we verify actual membership via joined_rooms, so a
-    slow-but-successful federated join is recognised instead of being retried
-    forever or falsely marked failed.
+    Returns the resolved space room id once the account is confirmed a member
+    (empty string on give-up). The room id is persisted so the web client can
+    land the user on the space by default. After each join attempt (and even if
+    the attempt raised, e.g. our HTTP timeout fired while Synapse kept going) we
+    verify actual membership via joined_rooms, so a slow-but-successful federated
+    join is recognised instead of being retried forever or falsely marked failed.
     """
     import time
 
@@ -1628,15 +1671,16 @@ def _join_community_with_retries(username: str, room_alias: str) -> bool:
         token = sso_login_for_owner(username)["access_token"]
     except SSOError as exc:
         app.logger.error("community join: owner SSO login failed; retry next boot: %s", exc)
-        return False
+        return ""
 
     # Warm up federation to the space's server first: resolve the alias, which
     # forces Synapse to do the DNS / .well-known / server-key handshake with the
     # remote homeserver. Doing this before the join means the join itself is far
     # more likely to succeed on the first try instead of racing cold federation.
-    if _is_joined_to_space(token, room_alias):
+    already = _resolve_joined_room_id(token, room_alias)
+    if already:
         app.logger.info("community join: already a member")
-        return True
+        return already
 
     # Patient retry loop: a cold federated join (first contact with the hub) can
     # take a couple of minutes to warm up. We keep trying for up to ~5 minutes
@@ -1654,18 +1698,19 @@ def _join_community_with_retries(username: str, room_alias: str) -> bool:
         try:
             room_id = _join_room_with_token(token, room_alias, timeout=60)
             app.logger.info("joined community room %s (%s)", room_alias, room_id)
-            return True
+            return room_id or _resolve_joined_room_id(token, room_alias)
         except SSOError as exc:
             last_exc = exc
             app.logger.warning("community join attempt %d failed: %s", attempt, exc)
         # Whether the POST succeeded, timed out, or errored, confirm membership:
         # Synapse may have completed the federated join after our client gave up.
-        if _is_joined_to_space(token, room_alias):
+        confirmed = _resolve_joined_room_id(token, room_alias)
+        if confirmed:
             app.logger.info("community join confirmed via membership check")
-            return True
+            return confirmed
         _t.sleep(min(2 + attempt * 1.5, 15))
     app.logger.error("community join failed after %d attempts (will retry next boot): %s", attempt, last_exc)
-    return False
+    return ""
 
 
 def _complete_pending_join() -> None:
@@ -1689,8 +1734,15 @@ def _complete_pending_join() -> None:
     if not room_alias:
         _update_settings(community_join_pending=False)
         return
-    if _join_community_with_retries(username, room_alias):
-        _update_settings(community_joined=True, community_join_pending=False, community_join_failed=False)
+    room_id = _join_community_with_retries(username, room_alias)
+    if room_id:
+        # Persist the resolved room id so the web client can land the owner on
+        # the community space by default (a stable id beats the alias, which can
+        # change). Empty room id shouldn't happen on success, but guard anyway.
+        updates = {"community_joined": True, "community_join_pending": False, "community_join_failed": False}
+        if room_id:
+            updates["community_room_id"] = room_id
+        _update_settings(**updates)
     else:
         _update_settings(community_join_failed=True)
 

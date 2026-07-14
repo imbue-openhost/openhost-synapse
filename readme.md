@@ -25,6 +25,8 @@ there is no toggle to enable it.
   owner in automatically via SSO, so most users never need one. Onboarding
   generates a strong random password for SSO to use internally.
 - After onboarding, opening the app signs that account straight into the client.
+  If the owner joined the community space, sign-in lands directly on that space's
+  lobby (instead of the empty Home view); otherwise it lands on the app root.
 - The web client and onboarding are gated by OpenHost zone auth, so only the
   owner can reach them. The Matrix APIs (`/_matrix`, `.well-known`) stay public
   as usual.

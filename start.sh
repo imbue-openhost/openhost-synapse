@@ -276,23 +276,56 @@ fi
 WEBROOT="/app/webclient"
 if [ -d "$WEBROOT" ]; then
     echo "Serving bundled web client (Cinny) from $WEBROOT"
-    # Render Cinny's config.json with this zone's homeserver pinned. Community
-    # room/space wiring is filled in later once federation + room alias exist;
-    # for now feature nothing (empty lists) so the client points only locally.
-    if [ -f /app/webclient-config.template.json ]; then
-        sed -e "s|SERVER_NAME_PLACEHOLDER|${SERVER_NAME}|g" \
-            -e "s|COMMUNITY_SPACE_PLACEHOLDER||g" \
-            -e "s|COMMUNITY_ROOM_PLACEHOLDER||g" \
-            -e "s|COMMUNITY_SERVER_PLACEHOLDER||g" \
-            /app/webclient-config.template.json > "$WEBROOT/config.json"
-        echo "Rendered web client config.json (homeserver=$SERVER_NAME)"
+    # Render Cinny's config.json with this zone's homeserver pinned, and wire the
+    # community space + hub server into featuredCommunities so the client surfaces
+    # the shared space and lets the owner browse/join its public rooms (Cinny's
+    # "explore" uses these). The space is featured by its alias; the hub server
+    # (the domain part of the alias) is featured so its public room directory is
+    # browsable. Values are JSON string literals (quoted).
+    COMMUNITY_ALIAS_CFG=$(python3 -c "
+import json
+try:
+    d = json.load(open('$SETTINGS_FILE'))
+    print(d.get('community_room_alias') or '')
+except Exception:
+    print('')
+")
+    if [ -n "$COMMUNITY_ALIAS_CFG" ]; then
+        # Hub server = the part after the first ':' in '#name:server'.
+        COMMUNITY_SERVER_CFG="${COMMUNITY_ALIAS_CFG#*:}"
+        SPACE_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$COMMUNITY_ALIAS_CFG")
+        SERVER_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$COMMUNITY_SERVER_CFG")
+    else
+        SPACE_JSON=""
+        SERVER_JSON=""
     fi
-    # Inject a first-run guard into index.html: if the client has no session yet,
-    # bounce to the OpenHost SSO/onboarding endpoint. Idempotent (only injects
-    # once). This is what makes the owner hit onboarding on first open without
-    # having to serve Cinny from a subpath.
+    if [ -f /app/webclient-config.template.json ]; then
+        # Use python for the substitution so JSON values with special chars are
+        # inserted safely (sed would choke on # and : in aliases).
+        python3 - "$WEBROOT/config.json" "$SERVER_NAME" "$SPACE_JSON" "$SERVER_JSON" <<'PYEOF'
+import sys
+out_path, server_name, space_json, server_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+tpl = open("/app/webclient-config.template.json").read()
+tpl = tpl.replace("SERVER_NAME_PLACEHOLDER", server_name)
+tpl = tpl.replace("COMMUNITY_SPACE_PLACEHOLDER", space_json)
+tpl = tpl.replace("COMMUNITY_ROOM_PLACEHOLDER", "")
+tpl = tpl.replace("COMMUNITY_SERVER_PLACEHOLDER", server_json)
+open(out_path, "w").write(tpl)
+PYEOF
+        echo "Rendered web client config.json (homeserver=$SERVER_NAME, space=${COMMUNITY_ALIAS_CFG:-none})"
+    fi
+    # Inject a first-run guard into index.html that runs before Cinny boots:
+    #   * No session yet at "/"  -> bounce to the OpenHost SSO/onboarding endpoint
+    #     (this is what makes the owner hit onboarding on first open without
+    #     serving Cinny from a subpath).
+    #   * Has a session at "/"   -> ask the app where to land and, if that's the
+    #     community space (not "/"), redirect there so a RETURNING visit opens
+    #     onto the space lobby instead of Cinny's empty Home view. A one-shot
+    #     sessionStorage flag stops it re-redirecting if the user later navigates
+    #     back to "/" on purpose within the same tab session.
+    # Idempotent (only injects once).
     if [ -f "$WEBROOT/index.html" ] && ! grep -q "openhost-firstrun-guard" "$WEBROOT/index.html"; then
-        GUARD='<script id="openhost-firstrun-guard">if(!localStorage.getItem("cinny_access_token")&&location.pathname==="/"){location.replace("/_openhost/community/login");}</script>'
+        GUARD='<script id="openhost-firstrun-guard">(function(){if(location.pathname!=="/")return;if(!localStorage.getItem("cinny_access_token")){location.replace("/_openhost/community/login");return;}if(sessionStorage.getItem("oh_landed"))return;var x=new XMLHttpRequest();x.open("GET","/_openhost/community/landing",false);try{x.send(null);if(x.status===200){var p=JSON.parse(x.responseText).path;if(p&&p!=="/"){sessionStorage.setItem("oh_landed","1");location.replace(p);}}}catch(e){}})();</script>'
         # Insert right after <head> so it runs before Cinny boots.
         python3 - "$WEBROOT/index.html" "$GUARD" <<'PYEOF'
 import sys
