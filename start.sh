@@ -269,9 +269,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # Web client (Cinny) — always served at the app root. The bundled client is
-# pinned to this homeserver. The OpenHost owner is auto-logged-in via SSO on
-# first open (a first-run guard bounces a session-less client to the SSO/
-# onboarding endpoint). Matrix APIs stay under /_matrix and /_synapse.
+# pinned to this homeserver. The OpenHost owner is auto-logged-in via SSO
+# whenever the client has no session (a first-run guard bounces a session-less
+# client to the SSO/onboarding endpoint, from any app path). Matrix APIs stay
+# under /_matrix and /_synapse.
 # ---------------------------------------------------------------------------
 WEBROOT="/app/webclient"
 if [ -d "$WEBROOT" ]; then
@@ -314,18 +315,32 @@ open(out_path, "w").write(tpl)
 PYEOF
         echo "Rendered web client config.json (homeserver=$SERVER_NAME, space=${COMMUNITY_ALIAS_CFG:-none})"
     fi
-    # Inject a first-run guard into index.html that runs before Cinny boots:
-    #   * No session yet at "/"  -> bounce to the OpenHost SSO/onboarding endpoint
-    #     (this is what makes the owner hit onboarding on first open without
-    #     serving Cinny from a subpath).
-    #   * Has a session at "/"   -> ask the app where to land and, if that's the
+    # Inject a first-run guard into index.html that runs before Cinny boots. Two
+    # behaviours, combined:
+    #   * No Matrix session (ANY path) -> bounce to the OpenHost SSO/onboarding
+    #     endpoint. This runs on every path, not just "/": Cinny is a single-page
+    #     app served with an index.html fallback, so a deep link or refresh on a
+    #     sub-path (e.g. /inbox, a room URL) also boots session-less and would
+    #     otherwise land on Cinny's own (dead-end, custom-homeservers-disabled)
+    #     login screen.
+    #   * Has a session AND on "/" -> ask the app where to land and, if that's the
     #     community space (not "/"), redirect there so a RETURNING visit opens
     #     onto the space lobby instead of Cinny's empty Home view. A one-shot
     #     sessionStorage flag stops it re-redirecting if the user later navigates
     #     back to "/" on purpose within the same tab session.
-    # Idempotent (only injects once).
+    # The guard only ever runs inside this served index.html; the SSO endpoint
+    # (/_openhost/*) and the Matrix APIs (/_matrix, /_synapse) are handled by
+    # Caddy before the SPA, so redirecting to /_openhost/community/login cannot
+    # loop back through here. Idempotent (only injects once).
+    #
+    # "Has a session" means ALL of the keys Cinny needs to initialise a session
+    # are present: the access token, the device id, and the homeserver base URL.
+    # A partial set (e.g. a token left behind but no device/hs after a partial
+    # clear or a Cinny storage-schema change) can't boot Cinny and would dead-end
+    # on its own login screen, so we treat that as "no session" and route through
+    # SSO, which repopulates all of them.
     if [ -f "$WEBROOT/index.html" ] && ! grep -q "openhost-firstrun-guard" "$WEBROOT/index.html"; then
-        GUARD='<script id="openhost-firstrun-guard">(function(){if(location.pathname!=="/")return;if(!localStorage.getItem("cinny_access_token")){location.replace("/_openhost/community/login");return;}if(sessionStorage.getItem("oh_landed"))return;var x=new XMLHttpRequest();x.open("GET","/_openhost/community/landing",false);try{x.send(null);if(x.status===200){var p=JSON.parse(x.responseText).path;if(p&&p!=="/"){sessionStorage.setItem("oh_landed","1");location.replace(p);}}}catch(e){}})();</script>'
+        GUARD='<script id="openhost-firstrun-guard">(function(){var ls=window.localStorage;if(!ls.getItem("cinny_access_token")||!ls.getItem("cinny_device_id")||!ls.getItem("cinny_hs_base_url")){location.replace("/_openhost/community/login");return;}if(location.pathname!=="/")return;if(sessionStorage.getItem("oh_landed"))return;var x=new XMLHttpRequest();x.open("GET","/_openhost/community/landing",false);try{x.send(null);if(x.status===200){var p=JSON.parse(x.responseText).path;if(p&&p!=="/"){sessionStorage.setItem("oh_landed","1");location.replace(p);}}}catch(e){}})();</script>'
         # Insert right after <head> so it runs before Cinny boots.
         python3 - "$WEBROOT/index.html" "$GUARD" <<'PYEOF'
 import sys
