@@ -332,8 +332,15 @@ PYEOF
     # (/_openhost/*) and the Matrix APIs (/_matrix, /_synapse) are handled by
     # Caddy before the SPA, so redirecting to /_openhost/community/login cannot
     # loop back through here. Idempotent (only injects once).
+    #
+    # "Has a session" means ALL of the keys Cinny needs to initialise a session
+    # are present: the access token, the device id, and the homeserver base URL.
+    # A partial set (e.g. a token left behind but no device/hs after a partial
+    # clear or a Cinny storage-schema change) can't boot Cinny and would dead-end
+    # on its own login screen, so we treat that as "no session" and route through
+    # SSO, which repopulates all of them.
     if [ -f "$WEBROOT/index.html" ] && ! grep -q "openhost-firstrun-guard" "$WEBROOT/index.html"; then
-        GUARD='<script id="openhost-firstrun-guard">(function(){if(!localStorage.getItem("cinny_access_token")){location.replace("/_openhost/community/login");return;}if(location.pathname!=="/")return;if(sessionStorage.getItem("oh_landed"))return;var x=new XMLHttpRequest();x.open("GET","/_openhost/community/landing",false);try{x.send(null);if(x.status===200){var p=JSON.parse(x.responseText).path;if(p&&p!=="/"){sessionStorage.setItem("oh_landed","1");location.replace(p);}}}catch(e){}})();</script>'
+        GUARD='<script id="openhost-firstrun-guard">(function(){var ls=window.localStorage;if(!ls.getItem("cinny_access_token")||!ls.getItem("cinny_device_id")||!ls.getItem("cinny_hs_base_url")){location.replace("/_openhost/community/login");return;}if(location.pathname!=="/")return;if(sessionStorage.getItem("oh_landed"))return;var x=new XMLHttpRequest();x.open("GET","/_openhost/community/landing",false);try{x.send(null);if(x.status===200){var p=JSON.parse(x.responseText).path;if(p&&p!=="/"){sessionStorage.setItem("oh_landed","1");location.replace(p);}}}catch(e){}})();</script>'
         # Insert right after <head> so it runs before Cinny boots.
         python3 - "$WEBROOT/index.html" "$GUARD" <<'PYEOF'
 import sys

@@ -14,6 +14,7 @@ text), including the regression we care about: firing on sub-paths, not only "/"
 Run: python3 -m unittest discover -s tests
 """
 
+import json
 import re
 import shutil
 import subprocess
@@ -36,21 +37,40 @@ GUARD_JS = extract_guard_script()
 NODE = shutil.which("node")
 
 
-def run_guard(path: str, token: str | None, landing_path: str = "/") -> str | None:
+# A complete Cinny session in localStorage requires all three keys the client
+# needs to initialise: the access token, the device id, and the homeserver URL.
+FULL_SESSION = {
+    "cinny_access_token": "syt_sometoken",
+    "cinny_device_id": "DEVICE123",
+    "cinny_hs_base_url": "https://hs.example.com",
+}
+
+
+def run_guard(
+    path: str,
+    token: str | None = None,
+    landing_path: str = "/",
+    session: dict | None = None,
+) -> str | None:
     """Execute the guard JS in Node with a stubbed browser environment and return
     the URL it redirected to (via location.replace), or None if it did not.
 
-    Stubs localStorage, location, sessionStorage, and a synchronous
-    XMLHttpRequest (the guard uses these to route session-less visitors to SSO
-    and to land a session-carrying visit to "/" on the community space). The
-    XHR stub returns ``{"path": landing_path}`` so the "/"-landing branch can be
-    exercised.
+    ``session`` is the localStorage contents to seed. For convenience, passing
+    ``token`` is shorthand: a truthy ``token`` seeds a FULL, valid session; a
+    ``None`` token seeds an empty localStorage. Pass ``session`` explicitly to
+    test partial/corrupt states.
+
+    Stubs window.localStorage, location, sessionStorage, and a synchronous
+    XMLHttpRequest (returning ``{"path": landing_path}``) so both the SSO-redirect
+    and the "/"-landing branches can be exercised.
     """
-    token_js = "null" if token is None else repr(token).replace("'", '"')
+    if session is None:
+        session = dict(FULL_SESSION) if token else {}
+    ls_json = repr(json.dumps(session))
     harness = f"""
     let redirectedTo = null;
     const localStorage = {{
-      _d: {{ {"" if token is None else f'"cinny_access_token": {token_js}'} }},
+      _d: JSON.parse({ls_json}),
       getItem(k) {{ return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; }},
     }};
     const sessionStorage = {{
@@ -59,6 +79,7 @@ def run_guard(path: str, token: str | None, landing_path: str = "/") -> str | No
       setItem(k, v) {{ this._d[k] = String(v); }},
       removeItem(k) {{ delete this._d[k]; }},
     }};
+    const window = {{ localStorage: localStorage }};
     const location = {{
       pathname: {path!r},
       replace(u) {{ redirectedTo = u; }},
@@ -132,6 +153,28 @@ class TestGuardBehavior(unittest.TestCase):
         # link is left alone even if a space is configured.
         space = "/%21abc%3Amatrix.openhost.imbue.com/lobby/"
         self.assertIsNone(run_guard("/inbox", "syt_sometoken", landing_path=space))
+
+    def test_partial_session_routes_through_sso(self):
+        # A token WITHOUT the device id / homeserver url can't boot Cinny and
+        # would dead-end on its own login screen. The guard must treat any
+        # incomplete session as no session and route through SSO (which
+        # repopulates all the keys). Cover each missing-key combination on both
+        # "/" and a sub-path.
+        partials = [
+            {"cinny_access_token": "syt_x"},  # token only
+            {"cinny_access_token": "syt_x", "cinny_device_id": "D"},  # no hs
+            {"cinny_access_token": "syt_x", "cinny_hs_base_url": "https://h"},  # no device
+            {"cinny_device_id": "D", "cinny_hs_base_url": "https://h"},  # no token
+            {"cinny_access_token": ""},  # empty token
+        ]
+        for sess in partials:
+            for path in ("/", "/inbox", "/room/!abc:server"):
+                with self.subTest(session=sorted(sess), path=path):
+                    self.assertEqual(run_guard(path, session=sess), self.SSO)
+
+    def test_full_session_does_not_route_through_sso(self):
+        # The complete key set is treated as a real session (no SSO redirect).
+        self.assertIsNone(run_guard("/inbox", session=dict(FULL_SESSION)))
 
 
 class TestGuardStatic(unittest.TestCase):
