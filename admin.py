@@ -1732,4 +1732,11 @@ if __name__ == "__main__":
 
     threading.Thread(target=_on_boot_worker, daemon=True).start()
     port = int(os.environ.get("ADMIN_PORT", "8009"))
-    app.run(host="127.0.0.1", port=port, debug=False)
+    # threaded=True: the default Flask dev server is single-threaded, which
+    # serialises all requests. Onboarding makes several Synapse calls (account
+    # creation, SSO, the community join) that can each take a while on a cold
+    # boot, and the onboarding page polls the status endpoint concurrently.
+    # Without threading those polls (and the POST's own response) queue behind a
+    # slow request and the page appears to hang. Threading lets them run
+    # independently.
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
