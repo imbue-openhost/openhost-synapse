@@ -1668,13 +1668,19 @@ def _join_community_with_retries(username: str, room_alias: str) -> bool:
     return False
 
 
-def _run_pending_join_now() -> None:
-    """Complete a pending community join in the running (already-federated)
-    Synapse, without a restart. Used by onboarding when the federation config
-    didn't change (so no restart is needed). Mirrors the join half of the boot
-    worker: on success clears the pending flag; on give-up marks this attempt
-    failed (so the onboarding page stops spinning) but leaves pending set so the
-    next boot retries."""
+def _complete_pending_join() -> None:
+    """If a community join is pending, complete it (federation is assumed already
+    active) and record the outcome in settings:
+
+      * success  -> community_joined=True, pending + failed cleared.
+      * give-up  -> community_join_failed=True (so the onboarding page stops
+                    spinning and forwards) while pending stays set, so a later
+                    boot retries in the background.
+
+    Idempotent and safe to call when nothing is pending. Shared by the inline
+    onboarding path (_run_pending_join_now) and the boot worker so the two can't
+    drift.
+    """
     settings = load_settings()
     if not settings.get("community_join_pending"):
         return
@@ -1687,6 +1693,12 @@ def _run_pending_join_now() -> None:
         _update_settings(community_joined=True, community_join_pending=False, community_join_failed=False)
     else:
         _update_settings(community_join_failed=True)
+
+
+def _run_pending_join_now() -> None:
+    """Complete a pending community join in the running (already-federated)
+    Synapse, without a restart. Used by onboarding when no restart is needed."""
+    _complete_pending_join()
 
 
 def _on_boot_worker() -> None:
@@ -1709,21 +1721,7 @@ def _on_boot_worker() -> None:
         return
     _update_settings(community_synapse_ready=True)
 
-    settings = load_settings()
-    if not settings.get("community_join_pending"):
-        return
-    room_alias = settings.get("community_room_alias", "")
-    username = settings.get("community_username") or "owner"
-    if not room_alias:
-        _update_settings(community_join_pending=False)
-        return
-
-    if _join_community_with_retries(username, room_alias):
-        _update_settings(community_joined=True, community_join_pending=False, community_join_failed=False)
-    else:
-        # Mark this boot as failed so the onboarding page stops spinning and
-        # forwards; leave pending set so the next boot retries in the background.
-        _update_settings(community_join_failed=True)
+    _complete_pending_join()
 
 
 def _cli_apply_settings() -> int:
