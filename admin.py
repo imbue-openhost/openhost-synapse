@@ -18,6 +18,7 @@ relaunches the container with the new config.
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -31,7 +32,14 @@ from pathlib import Path
 
 from flask import Flask, redirect, render_template_string, request
 
+# Emit our own INFO logs (account creation, community join progress, restart
+# decisions) to stderr, which start.sh surfaces in the container logs. Flask's
+# default logger otherwise sits at WARNING and hides the join diagnostics that
+# matter when debugging onboarding.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s admin: %(message)s")
+
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 
 DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data"))
 SETTINGS_FILE = DATA_DIR / "openhost_settings.json"
@@ -1622,26 +1630,41 @@ def _join_community_with_retries(username: str, room_alias: str) -> bool:
         app.logger.error("community join: owner SSO login failed; retry next boot: %s", exc)
         return False
 
-    # ~3 min of attempts: a cold federated join can take a while on first
-    # contact. Each POST /join gets a generous 60s timeout; between attempts we
-    # verify membership (in case a timed-out POST actually landed) before
-    # sleeping a short backoff.
+    # Warm up federation to the space's server first: resolve the alias, which
+    # forces Synapse to do the DNS / .well-known / server-key handshake with the
+    # remote homeserver. Doing this before the join means the join itself is far
+    # more likely to succeed on the first try instead of racing cold federation.
+    if _is_joined_to_space(token, room_alias):
+        app.logger.info("community join: already a member")
+        return True
+
+    # Patient retry loop: a cold federated join (first contact with the hub) can
+    # take a couple of minutes to warm up. We keep trying for up to ~5 minutes
+    # with a gentle progressive backoff (2s..15s), verifying actual membership
+    # after every attempt (Synapse may complete the join after our POST times
+    # out). Total budget is bounded so the onboarding spinner can't spin forever;
+    # on give-up we leave the join pending for the next boot to retry.
+    import time as _t
+
+    deadline = _t.monotonic() + 300
+    attempt = 0
     last_exc = None
-    for attempt in range(30):
+    while _t.monotonic() < deadline:
+        attempt += 1
         try:
             room_id = _join_room_with_token(token, room_alias, timeout=60)
             app.logger.info("joined community room %s (%s)", room_alias, room_id)
             return True
         except SSOError as exc:
             last_exc = exc
-            app.logger.warning("community join attempt %d failed: %s", attempt + 1, exc)
+            app.logger.warning("community join attempt %d failed: %s", attempt, exc)
         # Whether the POST succeeded, timed out, or errored, confirm membership:
         # Synapse may have completed the federated join after our client gave up.
         if _is_joined_to_space(token, room_alias):
             app.logger.info("community join confirmed via membership check")
             return True
-        time.sleep(2)
-    app.logger.error("community join failed after retries (will retry next boot): %s", last_exc)
+        _t.sleep(min(2 + attempt * 1.5, 15))
+    app.logger.error("community join failed after %d attempts (will retry next boot): %s", attempt, last_exc)
     return False
 
 
