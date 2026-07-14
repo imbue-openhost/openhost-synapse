@@ -275,7 +275,11 @@ def request_app_restart() -> bool:
     def _do_restart() -> None:
         import time
 
-        time.sleep(1.5)  # let the HTTP response flush to the browser
+        # Give the HTTP response time to fully flush to the browser before we
+        # kill Synapse (which tears the whole container down). The client also
+        # guards against a cut-off response by aborting + polling, but a
+        # comfortable delay here avoids that path in the common case.
+        time.sleep(3)
         for pid in _find_synapse_pids():
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -1154,16 +1158,35 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       btn.style.display = "none";
       saving.style.display = "flex";
 
+      // The POST triggers an app restart (to activate federation), which can
+      // cut off this very response mid-flight: the server may drop the
+      // connection while (or just after) sending it, leaving fetch hanging with
+      // headers received but body never completing. So bound the request with an
+      // AbortController: if it doesn't complete quickly we assume the restart
+      // began and switch to polling, rather than stranding the user on a spinner
+      // forever. pollStarted guards against double-starting the poll loop.
+      var pollStarted = false;
+      function startPolling() {
+        if (pollStarted) { return; }
+        pollStarted = true;
+        pollUntilUp();
+      }
+
+      var controller = new AbortController();
+      var abortTimer = setTimeout(function () { controller.abort(); }, 8000);
+
       // Use getAttribute("action"): a form control named "action" would
       // otherwise clobber form.action (it returns that element, not the URL),
       // sending the POST to a bogus path.
       fetch(form.getAttribute("action"), {
         method: "POST",
         body: new FormData(form),
-        headers: { "X-Requested-With": "fetch" }
+        headers: { "X-Requested-With": "fetch" },
+        signal: controller.signal
       }).then(function (r) {
         return r.json().catch(function () { return {}; });
       }).then(function (data) {
+        clearTimeout(abortTimer);
         if (data && data.error) {
           // Validation / setup error: show it and re-enable the form.
           saving.style.display = "none";
@@ -1176,11 +1199,14 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
           return;
         }
         // Onboarding succeeded and the app is restarting; poll then forward.
-        pollUntilUp();
+        startPolling();
       }).catch(function () {
-        // Network hiccup (possibly the restart already began). Assume success
-        // and poll for the app to come back rather than stranding the user.
-        pollUntilUp();
+        // Aborted (restart cut the response) or a network hiccup: assume the
+        // restart began and poll for the app to come back rather than stranding
+        // the user. The status endpoint's join_pending gate stops us forwarding
+        // before the join lands.
+        clearTimeout(abortTimer);
+        startPolling();
       });
     });
   })();
