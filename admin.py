@@ -18,6 +18,7 @@ relaunches the container with the new config.
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -31,7 +32,14 @@ from pathlib import Path
 
 from flask import Flask, redirect, render_template_string, request
 
+# Emit our own INFO logs (account creation, community join progress, restart
+# decisions) to stderr, which start.sh surfaces in the container logs. Flask's
+# default logger otherwise sits at WARNING and hides the join diagnostics that
+# matter when debugging onboarding.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s admin: %(message)s")
+
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 
 DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data"))
 SETTINGS_FILE = DATA_DIR / "openhost_settings.json"
@@ -70,6 +78,19 @@ DEFAULTS = {
     "open_registration": True,
     "community_onboarded": False,
     "community_joined": False,
+    # Set True by the onboarding POST when the owner opts into the community
+    # space; cleared once the join lands (or if the owner opted out). The
+    # onboarding page blocks its spinner on this being cleared.
+    "community_join_pending": False,
+    # Transient, per-boot flag: set True when this boot's join attempts all
+    # failed (so the onboarding page can stop spinning and forward instead of
+    # hanging forever). Reset at the start of every join run.
+    "community_join_failed": False,
+    # Transient, per-boot flag: set True by the boot worker once Synapse's
+    # client API answers on this boot. The onboarding status endpoint reads this
+    # instead of calling Synapse itself, so status polls stay cheap and never
+    # stall on a slow/restarting Synapse. Reset to False at the start of boot.
+    "community_synapse_ready": False,
     # The alias of the space the "join the community" flow joins. Defaults to the
     # canonical OpenHost community space; can be overridden.
     "community_room_alias": DEFAULT_COMMUNITY_ROOM_ALIAS,
@@ -186,12 +207,18 @@ def _patch_federation(content: str, enabled: bool) -> str:
     return content
 
 
-def apply_settings_to_yaml(settings: dict) -> None:
+def apply_settings_to_yaml(settings: dict) -> bool:
+    """Patch homeserver.yaml from settings. Returns True if the file content
+    actually changed (so the caller can decide whether a restart is needed);
+    a no-op patch returns False. Synapse only reads these at startup, so if the
+    running config already matches there is nothing to restart for."""
     try:
         content = HOMESERVER_YAML.read_text()
     except OSError as exc:
         app.logger.error("apply_settings_to_yaml: could not read homeserver.yaml: %s", exc)
         raise
+
+    original = content
 
     # Registration
     content = _set_yaml_bool(content, "enable_registration", settings["open_registration"])
@@ -204,11 +231,15 @@ def apply_settings_to_yaml(settings: dict) -> None:
     # Federation
     content = _patch_federation(content, settings["federation_enabled"])
 
+    if content == original:
+        return False
+
     try:
         HOMESERVER_YAML.write_text(content)
     except OSError as exc:
         app.logger.error("apply_settings_to_yaml: could not write homeserver.yaml: %s", exc)
         raise
+    return True
 
 
 def _find_synapse_pids() -> list[int]:
@@ -262,7 +293,11 @@ def request_app_restart() -> bool:
     def _do_restart() -> None:
         import time
 
-        time.sleep(1.5)  # let the HTTP response flush to the browser
+        # Give the HTTP response time to fully flush to the browser before we
+        # kill Synapse (which tears the whole container down). The client also
+        # guards against a cut-off response by aborting + polling, but a
+        # comfortable delay here avoids that path in the common case.
+        time.sleep(3)
         for pid in _find_synapse_pids():
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -495,7 +530,9 @@ class SSOError(Exception):
     pass
 
 
-def _synapse_request(method: str, path: str, token: str | None = None, body: dict | None = None) -> dict:
+def _synapse_request(
+    method: str, path: str, token: str | None = None, body: dict | None = None, timeout: int = 15
+) -> dict:
     url = f"{SYNAPSE_BASE}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -503,7 +540,7 @@ def _synapse_request(method: str, path: str, token: str | None = None, body: dic
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode()
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
@@ -888,20 +925,51 @@ def save():
     return _render_index(message=message, warning=warning)
 
 
-def _join_community_room(username: str, room_alias: str) -> str:
-    """Join the owner's account to a (federated) room/space by alias.
+def _join_room_with_token(token: str, room_alias: str, timeout: int = 60) -> str:
+    """Join a (federated) room/space by alias using an existing access token.
 
     Returns the room_id. Works for a space alias too (a space is just a room);
     joining a space gives the client the space so the user can browse its rooms.
     Federation must already be enabled and active for a remote alias to resolve.
+
+    Takes the token as an argument so callers that retry (federation warmup) can
+    mint one session up front and reuse it, instead of re-logging-in — and
+    minting a new device — on every attempt.
+
+    ``timeout`` defaults to 60s: a *cold* federated join (first contact with the
+    remote server, alias resolution, key fetch, partial-state sync kickoff) can
+    legitimately take well over the 15s default, and cutting it short makes the
+    join look like it failed even though Synapse goes on to complete it.
     """
-    session = sso_login_for_owner(username)
-    token = session["access_token"]
     # POST /join/{roomIdOrAlias} resolves the alias (over federation if remote)
     # and joins. Idempotent: joining an already-joined room returns the room_id.
     quoted = urllib.parse.quote(room_alias, safe="")
-    resp = _synapse_request("POST", f"/_matrix/client/v3/join/{quoted}", token=token, body={})
+    resp = _synapse_request("POST", f"/_matrix/client/v3/join/{quoted}", token=token, body={}, timeout=timeout)
     return resp.get("room_id", "")
+
+
+def _is_joined_to_space(token: str, room_alias: str) -> bool:
+    """True if the token's account is already a member of the space behind
+    ``room_alias``. Used to confirm a join actually landed even when the join
+    POST itself timed out on our side (Synapse can finish the federated join
+    after our HTTP client gives up).
+
+    Resolves the alias to a room_id, then checks the account's joined rooms.
+    Any failure (alias not resolvable yet, request error) returns False so the
+    caller keeps retrying.
+    """
+    try:
+        quoted = urllib.parse.quote(room_alias, safe="")
+        resolved = _synapse_request(
+            "GET", f"/_matrix/client/v3/directory/room/{quoted}", token=token, timeout=30
+        )
+        room_id = resolved.get("room_id")
+        if not room_id:
+            return False
+        joined = _synapse_request("GET", "/_matrix/client/v3/joined_rooms", token=token, timeout=30)
+        return room_id in (joined.get("joined_rooms") or [])
+    except SSOError:
+        return False
 
 
 def _default_account_username() -> str:
@@ -1036,7 +1104,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
     <button id="submit-btn" type="submit" class="btn"{% if saving %} style="display:none"{% endif %}>Finish &amp; open chat</button>
     <div id="saving" class="saving"{% if not saving %} style="display:none"{% endif %}>
       <span class="spinner"></span>
-      <span>Setting up chat and starting the server. This opens automatically...</span>
+      <span id="saving-msg">Setting up chat and starting the server. This opens automatically...</span>
     </div>
   </form>
 
@@ -1050,33 +1118,52 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
 
     // Submit onboarding via fetch so we stay on this screen with a spinner,
     // then poll until the app finishes its automatic restart (to activate
-    // federation) and forward to the SSO login. This replaces the old
+    // federation) AND the community-space join has landed, so the shared space
+    // is already there when the chat client opens. This replaces the old
     // transitional "Almost there" page.
     var LOGIN_URL = "/_openhost/community/login";
+    var STATUS_URL = "/_openhost/community/onboarding/status";
+
+    function setSavingMsg(text) {
+      var el = document.getElementById("saving-msg");
+      if (el) { el.textContent = text; }
+    }
 
     function pollUntilUp() {
       // The app restarts to apply federation; the admin server (which served
-      // this page) goes away and comes back. Poll Synapse's public versions
-      // endpoint (served through the router even during onboarding) and only
-      // forward once it responds, so we never land on a not-ready screen.
+      // this page) goes away and comes back. Poll the onboarding status
+      // endpoint and only forward once it reports done: Synapse is back up and
+      // no community-space join is still outstanding. While the join is in
+      // flight the spinner keeps spinning ("Joining the community space...").
       var attempts = 0;
-      var maxAttempts = 120;  // ~6 min at 3s
+      var maxAttempts = 200;  // ~6.5 min at 2s
       function ping() {
         attempts++;
-        fetch("/_matrix/client/versions", { cache: "no-store" })
-          .then(function (r) {
-            if (r.ok) { window.location.replace(LOGIN_URL); }
-            else if (attempts < maxAttempts) { setTimeout(ping, 3000); }
+        fetch(STATUS_URL, { cache: "no-store", headers: { "X-Requested-With": "fetch" } })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (data) {
+            if (data) {
+              if (data.phase === "joining") {
+                setSavingMsg("Joining the community space...");
+              } else if (data.phase === "starting") {
+                setSavingMsg("Starting the server...");
+              }
+              // done => Synapse up and the join has landed (or none was wanted,
+              // or this boot's join attempts gave up). Forward to the client.
+              if (data.done) { window.location.replace(LOGIN_URL); return; }
+            }
+            if (attempts < maxAttempts) { setTimeout(ping, 2000); }
             else { window.location.replace(LOGIN_URL); }
           })
           .catch(function () {
-            if (attempts < maxAttempts) { setTimeout(ping, 3000); }
+            // The server is mid-restart (endpoint unreachable). Keep polling.
+            if (attempts < maxAttempts) { setTimeout(ping, 2000); }
             else { window.location.replace(LOGIN_URL); }
           });
       }
       // Give the server a moment to begin restarting before polling so we don't
       // immediately see the still-up (about-to-die) instance and forward early.
-      setTimeout(ping, 4000);
+      setTimeout(ping, 2000);
     }
 
     // Non-JS fallback path: the server already accepted onboarding and rendered
@@ -1089,16 +1176,35 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
       btn.style.display = "none";
       saving.style.display = "flex";
 
+      // The POST triggers an app restart (to activate federation), which can
+      // cut off this very response mid-flight: the server may drop the
+      // connection while (or just after) sending it, leaving fetch hanging with
+      // headers received but body never completing. So bound the request with an
+      // AbortController: if it doesn't complete quickly we assume the restart
+      // began and switch to polling, rather than stranding the user on a spinner
+      // forever. pollStarted guards against double-starting the poll loop.
+      var pollStarted = false;
+      function startPolling() {
+        if (pollStarted) { return; }
+        pollStarted = true;
+        pollUntilUp();
+      }
+
+      var controller = new AbortController();
+      var abortTimer = setTimeout(function () { controller.abort(); }, 8000);
+
       // Use getAttribute("action"): a form control named "action" would
       // otherwise clobber form.action (it returns that element, not the URL),
       // sending the POST to a bogus path.
       fetch(form.getAttribute("action"), {
         method: "POST",
         body: new FormData(form),
-        headers: { "X-Requested-With": "fetch" }
+        headers: { "X-Requested-With": "fetch" },
+        signal: controller.signal
       }).then(function (r) {
         return r.json().catch(function () { return {}; });
       }).then(function (data) {
+        clearTimeout(abortTimer);
         if (data && data.error) {
           // Validation / setup error: show it and re-enable the form.
           saving.style.display = "none";
@@ -1111,11 +1217,14 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
           return;
         }
         // Onboarding succeeded and the app is restarting; poll then forward.
-        pollUntilUp();
+        startPolling();
       }).catch(function () {
-        // Network hiccup (possibly the restart already began). Assume success
-        // and poll for the app to come back rather than stranding the user.
-        pollUntilUp();
+        // Aborted (restart cut the response) or a network hiccup: assume the
+        // restart began and poll for the app to come back rather than stranding
+        // the user. The status endpoint's join_pending gate stops us forwarding
+        // before the join lands.
+        clearTimeout(abortTimer);
+        startPolling();
       });
     });
   })();
@@ -1341,15 +1450,27 @@ def community_onboarding():
     # A community join is pending only if the owner opted in AND a space/room
     # alias is configured. Joining a remote (federated) alias requires federation
     # active in the running Synapse, which only takes effect after a restart, so
-    # the join is completed on the next boot by _complete_pending_community_join.
+    # the join is completed on the next boot by the boot worker (_on_boot_worker).
     want_join = bool(join_community and room_alias)
     settings["federation_enabled"] = enable_federation
     settings["community_join_pending"] = want_join
+    # Fresh onboarding run: clear any stale per-boot transient flags so the
+    # page's status poll starts clean.
+    settings["community_join_failed"] = False
+    settings["community_synapse_ready"] = False
     save_settings(settings)
 
-    # Federation is applied by patching homeserver.yaml + an automatic app
-    # restart. It's on by default, so onboarding always restarts once here to
-    # activate it; any pending community join then completes in the background.
+    # Persist the federation setting to homeserver.yaml so it survives future
+    # boots. Crucially we do NOT restart here: onboarding always keeps federation
+    # ENABLED (it's the default and there is no onboarding toggle for it), and
+    # start.sh already applies federation to homeserver.yaml at every boot, so
+    # the running Synapse ALREADY has federation active before onboarding runs.
+    # The old "restart to activate federation" step was therefore unnecessary on
+    # this path, and the self-restart (kill Synapse, rely on podman to relaunch
+    # the rootless container) is inherently fragile — podman sometimes leaves the
+    # container stopped, so the app 502'd for minutes. Removing the restart makes
+    # onboarding deterministic; the community join runs inline against the
+    # already-federated Synapse.
     try:
         apply_settings_to_yaml(settings)
     except OSError as exc:
@@ -1359,9 +1480,16 @@ def community_onboarding():
             error="Set up chat, but could not turn on federation. You can "
             "retry from the admin console.",
         )
-    request_app_restart()
-    # Success. The app is restarting to activate federation. The onboarding page
-    # stays put (spinner) and polls until it comes back, then forwards to login.
+
+    # Synapse is already up and federated. Mark it ready and complete the join in
+    # the background so the response returns immediately; the page polls status
+    # and forwards once the join lands (blocking on the join is the whole point).
+    _update_settings(community_synapse_ready=True)
+    if want_join:
+        threading.Thread(target=_run_pending_join_now, daemon=True).start()
+    else:
+        _update_settings(community_join_pending=False)
+
     # JS path: return JSON so the page's fetch handler starts polling. Non-JS
     # fallback: re-render this same screen in the saving state (self-polls).
     if _wants_json():
@@ -1409,52 +1537,191 @@ def community_login():
     )
 
 
-def _complete_pending_community_join() -> None:
-    """Background worker: if a community join is pending (federation was just
-    enabled during onboarding), wait for Synapse to come up, join the configured
-    room over federation, and clear the pending flag. Runs once per boot."""
+@app.route("/_openhost/community/onboarding/status")
+def community_onboarding_status():
+    """JSON status the onboarding page polls after the post-onboarding restart.
+
+    The page keeps its spinner until the community-space join has actually
+    landed (``done`` True), so the shared space is already visible the moment
+    the user reaches the chat client, instead of appearing a bit later. When no
+    join was requested, or this boot's join attempts gave up, ``done`` is True
+    as well so the page forwards instead of hanging.
+
+    This handler is intentionally cheap: it only reads the settings file and
+    does NOT call Synapse. The background join worker records Synapse readiness
+    (``community_synapse_ready``) and join progress into settings, so a slow or
+    still-restarting Synapse can never stall these frequent status polls. While
+    the app is mid-restart the whole endpoint is simply unreachable (the client
+    keeps polling), which is the real "server not back yet" signal.
+    """
+    settings = load_settings()
+    synapse_up = bool(settings.get("community_synapse_ready"))
+    want_join = bool(settings.get("community_room_alias")) and (
+        settings.get("community_join_pending") or settings.get("community_joined")
+    )
+    join_pending = bool(settings.get("community_join_pending"))
+    joined = bool(settings.get("community_joined"))
+    join_failed = bool(settings.get("community_join_failed"))
+
+    # "done" means the page can forward to the chat client:
+    #   * Synapse is back up, AND
+    #   * either the join isn't pending (joined or opted out), OR this boot's
+    #     join attempts gave up (join_failed) so we forward rather than hang
+    #     forever. A failed join stays pending so the next boot retries in the
+    #     background; the user just sees the space appear a little later.
+    done = synapse_up and (not join_pending or join_failed)
+
+    if not synapse_up:
+        phase = "starting"
+    elif join_failed and not joined:
+        phase = "join_failed"
+    elif join_pending:
+        phase = "joining"
+    else:
+        phase = "ready"
+
+    return {
+        "synapse_up": synapse_up,
+        "want_join": want_join,
+        "join_pending": join_pending,
+        "joined": joined,
+        "join_failed": join_failed,
+        "phase": phase,
+        "done": done,
+    }
+
+
+def _update_settings(**changes: object) -> dict:
+    """Read-modify-write helper so the boot worker's flag updates don't clobber
+    concurrent writes (e.g. an admin save) between load and save."""
+    settings = load_settings()
+    settings.update(changes)
+    save_settings(settings)
+    return settings
+
+
+def _wait_for_synapse(attempts: int = 120, interval: float = 1.0) -> bool:
+    """Poll Synapse's client API until it answers. ~2 min at 1s by default."""
     import time
 
+    for _ in range(attempts):
+        try:
+            _synapse_request("GET", "/_matrix/client/versions", timeout=10)
+            return True
+        except SSOError:
+            time.sleep(interval)
+    return False
+
+
+def _join_community_with_retries(username: str, room_alias: str) -> bool:
+    """Join the owner to the community space, retrying through federation warmup.
+
+    Returns True once the account is confirmed a member of the space. After each
+    join attempt (and even if the attempt raised, e.g. our HTTP timeout fired
+    while Synapse kept going) we verify actual membership via joined_rooms, so a
+    slow-but-successful federated join is recognised instead of being retried
+    forever or falsely marked failed.
+    """
+    import time
+
+    try:
+        token = sso_login_for_owner(username)["access_token"]
+    except SSOError as exc:
+        app.logger.error("community join: owner SSO login failed; retry next boot: %s", exc)
+        return False
+
+    # Warm up federation to the space's server first: resolve the alias, which
+    # forces Synapse to do the DNS / .well-known / server-key handshake with the
+    # remote homeserver. Doing this before the join means the join itself is far
+    # more likely to succeed on the first try instead of racing cold federation.
+    if _is_joined_to_space(token, room_alias):
+        app.logger.info("community join: already a member")
+        return True
+
+    # Patient retry loop: a cold federated join (first contact with the hub) can
+    # take a couple of minutes to warm up. We keep trying for up to ~5 minutes
+    # with a gentle progressive backoff (2s..15s), verifying actual membership
+    # after every attempt (Synapse may complete the join after our POST times
+    # out). Total budget is bounded so the onboarding spinner can't spin forever;
+    # on give-up we leave the join pending for the next boot to retry.
+    import time as _t
+
+    deadline = _t.monotonic() + 300
+    attempt = 0
+    last_exc = None
+    while _t.monotonic() < deadline:
+        attempt += 1
+        try:
+            room_id = _join_room_with_token(token, room_alias, timeout=60)
+            app.logger.info("joined community room %s (%s)", room_alias, room_id)
+            return True
+        except SSOError as exc:
+            last_exc = exc
+            app.logger.warning("community join attempt %d failed: %s", attempt, exc)
+        # Whether the POST succeeded, timed out, or errored, confirm membership:
+        # Synapse may have completed the federated join after our client gave up.
+        if _is_joined_to_space(token, room_alias):
+            app.logger.info("community join confirmed via membership check")
+            return True
+        _t.sleep(min(2 + attempt * 1.5, 15))
+    app.logger.error("community join failed after %d attempts (will retry next boot): %s", attempt, last_exc)
+    return False
+
+
+def _complete_pending_join() -> None:
+    """If a community join is pending, complete it (federation is assumed already
+    active) and record the outcome in settings:
+
+      * success  -> community_joined=True, pending + failed cleared.
+      * give-up  -> community_join_failed=True (so the onboarding page stops
+                    spinning and forwards) while pending stays set, so a later
+                    boot retries in the background.
+
+    Idempotent and safe to call when nothing is pending. Shared by the inline
+    onboarding path (_run_pending_join_now) and the boot worker so the two can't
+    drift.
+    """
     settings = load_settings()
     if not settings.get("community_join_pending"):
         return
     room_alias = settings.get("community_room_alias", "")
     username = settings.get("community_username") or "owner"
     if not room_alias:
+        _update_settings(community_join_pending=False)
         return
+    if _join_community_with_retries(username, room_alias):
+        _update_settings(community_joined=True, community_join_pending=False, community_join_failed=False)
+    else:
+        _update_settings(community_join_failed=True)
 
-    # Wait for Synapse's client API to be reachable (up to ~2 min).
-    reachable = False
-    for _ in range(60):
-        try:
-            _synapse_request("GET", "/_matrix/client/versions")
-            reachable = True
-            break
-        except SSOError:
-            time.sleep(2)
-    if not reachable:
-        app.logger.error("pending community join: Synapse never became reachable; retry next boot")
+
+def _run_pending_join_now() -> None:
+    """Complete a pending community join in the running (already-federated)
+    Synapse, without a restart. Used by onboarding when no restart is needed."""
+    _complete_pending_join()
+
+
+def _on_boot_worker() -> None:
+    """Per-boot background worker.
+
+    1. Marks Synapse readiness in settings once its client API answers, so the
+       onboarding status endpoint (which only reads settings) can report the
+       server is back up without calling Synapse itself.
+    2. If a community-space join is pending (federation was just enabled during
+       onboarding), completes it over federation and clears the pending flag.
+
+    Runs once per boot. Idempotent: joining an already-joined space is a no-op.
+    """
+    # Reset per-boot transient flags at the very start so a fresh boot never
+    # shows a stale "ready"/"failed" to the onboarding page.
+    _update_settings(community_synapse_ready=False, community_join_failed=False)
+
+    if not _wait_for_synapse():
+        app.logger.error("boot worker: Synapse never became reachable this boot")
         return
+    _update_settings(community_synapse_ready=True)
 
-    # Retry the join a handful of times within this boot: a remote (federated)
-    # alias may not resolve immediately after Synapse starts (federation/DNS
-    # warmup). If all attempts fail, leave the pending flag set so the next boot
-    # retries.
-    last_exc = None
-    for attempt in range(10):
-        try:
-            room_id = _join_community_room(username, room_alias)
-            settings = load_settings()
-            settings["community_joined"] = True
-            settings["community_join_pending"] = False
-            save_settings(settings)
-            app.logger.info("joined community room %s (%s)", room_alias, room_id)
-            return
-        except SSOError as exc:
-            last_exc = exc
-            app.logger.warning("community join attempt %d failed: %s", attempt + 1, exc)
-            time.sleep(6)
-    app.logger.error("pending community join failed after retries (will retry next boot): %s", last_exc)
+    _complete_pending_join()
 
 
 def _cli_apply_settings() -> int:
@@ -1484,6 +1751,13 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "apply-settings":
         raise SystemExit(_cli_apply_settings())
 
-    threading.Thread(target=_complete_pending_community_join, daemon=True).start()
+    threading.Thread(target=_on_boot_worker, daemon=True).start()
     port = int(os.environ.get("ADMIN_PORT", "8009"))
-    app.run(host="127.0.0.1", port=port, debug=False)
+    # threaded=True: the default Flask dev server is single-threaded, which
+    # serialises all requests. Onboarding makes several Synapse calls (account
+    # creation, SSO, the community join) that can each take a while on a cold
+    # boot, and the onboarding page polls the status endpoint concurrently.
+    # Without threading those polls (and the POST's own response) queue behind a
+    # slow request and the page appears to hang. Threading lets them run
+    # independently.
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
