@@ -199,12 +199,18 @@ def _patch_federation(content: str, enabled: bool) -> str:
     return content
 
 
-def apply_settings_to_yaml(settings: dict) -> None:
+def apply_settings_to_yaml(settings: dict) -> bool:
+    """Patch homeserver.yaml from settings. Returns True if the file content
+    actually changed (so the caller can decide whether a restart is needed);
+    a no-op patch returns False. Synapse only reads these at startup, so if the
+    running config already matches there is nothing to restart for."""
     try:
         content = HOMESERVER_YAML.read_text()
     except OSError as exc:
         app.logger.error("apply_settings_to_yaml: could not read homeserver.yaml: %s", exc)
         raise
+
+    original = content
 
     # Registration
     content = _set_yaml_bool(content, "enable_registration", settings["open_registration"])
@@ -217,11 +223,15 @@ def apply_settings_to_yaml(settings: dict) -> None:
     # Federation
     content = _patch_federation(content, settings["federation_enabled"])
 
+    if content == original:
+        return False
+
     try:
         HOMESERVER_YAML.write_text(content)
     except OSError as exc:
         app.logger.error("apply_settings_to_yaml: could not write homeserver.yaml: %s", exc)
         raise
+    return True
 
 
 def _find_synapse_pids() -> list[int]:
@@ -1442,11 +1452,15 @@ def community_onboarding():
     settings["community_synapse_ready"] = False
     save_settings(settings)
 
-    # Federation is applied by patching homeserver.yaml + an automatic app
-    # restart. It's on by default, so onboarding always restarts once here to
-    # activate it; any pending community join then completes in the background.
+    # Apply the federation setting to homeserver.yaml. Synapse only reads this at
+    # startup, so a *change* requires a restart to take effect. But federation is
+    # ON by default, so on the common fresh-onboarding path the running Synapse
+    # ALREADY has federation active and the patch is a no-op — in that case we
+    # must NOT restart. The self-restart (kill Synapse, rely on podman to
+    # relaunch the container) is inherently fragile, so we avoid it whenever the
+    # running config already matches: no restart, join inline, forward promptly.
     try:
-        apply_settings_to_yaml(settings)
+        config_changed = apply_settings_to_yaml(settings)
     except OSError as exc:
         app.logger.error("could not apply federation setting: %s", exc)
         return _onboarding_error(
@@ -1454,9 +1468,25 @@ def community_onboarding():
             error="Set up chat, but could not turn on federation. You can "
             "retry from the admin console.",
         )
-    request_app_restart()
-    # Success. The app is restarting to activate federation. The onboarding page
-    # stays put (spinner) and polls until it comes back, then forwards to login.
+
+    if config_changed:
+        # Federation state genuinely changed; a restart is required for Synapse
+        # to pick it up. The boot worker completes any pending join afterwards.
+        # The onboarding page keeps its spinner and polls the status endpoint
+        # until the app is back and the join has landed, then forwards.
+        request_app_restart()
+    else:
+        # No restart needed: federation is already active in the running Synapse.
+        # Mark Synapse ready now and complete the join in the background so the
+        # response returns immediately; the page polls status and forwards once
+        # the join lands. This avoids the fragile restart entirely on the common
+        # path.
+        _update_settings(community_synapse_ready=True)
+        if want_join:
+            threading.Thread(target=_run_pending_join_now, daemon=True).start()
+        else:
+            _update_settings(community_join_pending=False)
+
     # JS path: return JSON so the page's fetch handler starts polling. Non-JS
     # fallback: re-render this same screen in the saving state (self-polls).
     if _wants_json():
@@ -1618,6 +1648,27 @@ def _join_community_with_retries(username: str, room_alias: str) -> bool:
         time.sleep(2)
     app.logger.error("community join failed after retries (will retry next boot): %s", last_exc)
     return False
+
+
+def _run_pending_join_now() -> None:
+    """Complete a pending community join in the running (already-federated)
+    Synapse, without a restart. Used by onboarding when the federation config
+    didn't change (so no restart is needed). Mirrors the join half of the boot
+    worker: on success clears the pending flag; on give-up marks this attempt
+    failed (so the onboarding page stops spinning) but leaves pending set so the
+    next boot retries."""
+    settings = load_settings()
+    if not settings.get("community_join_pending"):
+        return
+    room_alias = settings.get("community_room_alias", "")
+    username = settings.get("community_username") or "owner"
+    if not room_alias:
+        _update_settings(community_join_pending=False)
+        return
+    if _join_community_with_retries(username, room_alias):
+        _update_settings(community_joined=True, community_join_pending=False, community_join_failed=False)
+    else:
+        _update_settings(community_join_failed=True)
 
 
 def _on_boot_worker() -> None:
