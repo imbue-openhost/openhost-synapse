@@ -36,9 +36,16 @@ GUARD_JS = extract_guard_script()
 NODE = shutil.which("node")
 
 
-def run_guard(path: str, token: str | None) -> str | None:
-    """Execute the guard JS in Node with a stubbed window/localStorage and return
-    the URL it redirected to (via location.replace), or None if it did not."""
+def run_guard(path: str, token: str | None, landing_path: str = "/") -> str | None:
+    """Execute the guard JS in Node with a stubbed browser environment and return
+    the URL it redirected to (via location.replace), or None if it did not.
+
+    Stubs localStorage, location, sessionStorage, and a synchronous
+    XMLHttpRequest (the guard uses these to route session-less visitors to SSO
+    and to land a session-carrying visit to "/" on the community space). The
+    XHR stub returns ``{"path": landing_path}`` so the "/"-landing branch can be
+    exercised.
+    """
     token_js = "null" if token is None else repr(token).replace("'", '"')
     harness = f"""
     let redirectedTo = null;
@@ -46,12 +53,23 @@ def run_guard(path: str, token: str | None) -> str | None:
       _d: {{ {"" if token is None else f'"cinny_access_token": {token_js}'} }},
       getItem(k) {{ return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; }},
     }};
+    const sessionStorage = {{
+      _d: {{}},
+      getItem(k) {{ return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; }},
+      setItem(k, v) {{ this._d[k] = String(v); }},
+      removeItem(k) {{ delete this._d[k]; }},
+    }};
     const location = {{
       pathname: {path!r},
       replace(u) {{ redirectedTo = u; }},
     }};
-    // The guard references bare `localStorage` and `location` (globals in a
-    // browser). Evaluate it with those in scope.
+    // Minimal synchronous XMLHttpRequest that returns the landing path, matching
+    // the /_openhost/community/landing endpoint the guard queries.
+    class XMLHttpRequest {{
+      open(method, url, async_) {{ this._url = url; }}
+      send() {{ this.status = 200; this.responseText = JSON.stringify({{ path: {landing_path!r} }}); }}
+    }}
+    // The guard references these as browser globals. Evaluate it with them in scope.
     (function () {{ {GUARD_JS} }})();
     process.stdout.write(redirectedTo === null ? "" : redirectedTo);
     """
@@ -98,6 +116,22 @@ class TestGuardBehavior(unittest.TestCase):
         for path in ["/inbox/notifications/", "/room/!abc:server/settings"]:
             with self.subTest(path=path):
                 self.assertIsNone(run_guard(path, "syt_sometoken"))
+
+    def test_session_on_root_lands_on_space(self):
+        # A returning visit to "/" WITH a session lands on the community space
+        # lobby (from the landing endpoint), not Cinny's Home.
+        space = "/%21abc%3Amatrix.openhost.imbue.com/lobby/"
+        self.assertEqual(run_guard("/", "syt_sometoken", landing_path=space), space)
+
+    def test_session_on_root_no_space_stays(self):
+        # If the landing endpoint says "/" (no joined space), don't redirect.
+        self.assertIsNone(run_guard("/", "syt_sometoken", landing_path="/"))
+
+    def test_session_on_subpath_ignores_landing(self):
+        # The space-landing redirect only applies to "/"; a session-carrying deep
+        # link is left alone even if a space is configured.
+        space = "/%21abc%3Amatrix.openhost.imbue.com/lobby/"
+        self.assertIsNone(run_guard("/inbox", "syt_sometoken", landing_path=space))
 
 
 class TestGuardStatic(unittest.TestCase):
