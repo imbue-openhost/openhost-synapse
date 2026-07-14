@@ -1566,6 +1566,19 @@ def community_login():
     )
 
 
+@app.route("/_openhost/community/landing")
+def community_landing():
+    """Return the path the web client should open on, as JSON: {"path": "..."}.
+
+    Used by the index.html first-run guard so that a RETURNING visit to "/"
+    (where the client already has a session, so it never hits the SSO bootstrap)
+    still opens onto the community space lobby instead of Cinny's empty Home
+    view. The path is computed from live settings, so it reflects the joined
+    space (by stable room id, alias fallback) or "/" when none is joined.
+    """
+    return {"path": _community_landing_path(load_settings())}
+
+
 @app.route("/_openhost/community/onboarding/status")
 def community_onboarding_status():
     """JSON status the onboarding page polls after the post-onboarding restart.
