@@ -1452,15 +1452,19 @@ def community_onboarding():
     settings["community_synapse_ready"] = False
     save_settings(settings)
 
-    # Apply the federation setting to homeserver.yaml. Synapse only reads this at
-    # startup, so a *change* requires a restart to take effect. But federation is
-    # ON by default, so on the common fresh-onboarding path the running Synapse
-    # ALREADY has federation active and the patch is a no-op — in that case we
-    # must NOT restart. The self-restart (kill Synapse, rely on podman to
-    # relaunch the container) is inherently fragile, so we avoid it whenever the
-    # running config already matches: no restart, join inline, forward promptly.
+    # Persist the federation setting to homeserver.yaml so it survives future
+    # boots. Crucially we do NOT restart here: onboarding always keeps federation
+    # ENABLED (it's the default and there is no onboarding toggle for it), and
+    # start.sh already applies federation to homeserver.yaml at every boot, so
+    # the running Synapse ALREADY has federation active before onboarding runs.
+    # The old "restart to activate federation" step was therefore unnecessary on
+    # this path, and the self-restart (kill Synapse, rely on podman to relaunch
+    # the rootless container) is inherently fragile — podman sometimes leaves the
+    # container stopped, so the app 502'd for minutes. Removing the restart makes
+    # onboarding deterministic; the community join runs inline against the
+    # already-federated Synapse.
     try:
-        config_changed = apply_settings_to_yaml(settings)
+        apply_settings_to_yaml(settings)
     except OSError as exc:
         app.logger.error("could not apply federation setting: %s", exc)
         return _onboarding_error(
@@ -1469,23 +1473,14 @@ def community_onboarding():
             "retry from the admin console.",
         )
 
-    if config_changed:
-        # Federation state genuinely changed; a restart is required for Synapse
-        # to pick it up. The boot worker completes any pending join afterwards.
-        # The onboarding page keeps its spinner and polls the status endpoint
-        # until the app is back and the join has landed, then forwards.
-        request_app_restart()
+    # Synapse is already up and federated. Mark it ready and complete the join in
+    # the background so the response returns immediately; the page polls status
+    # and forwards once the join lands (blocking on the join is the whole point).
+    _update_settings(community_synapse_ready=True)
+    if want_join:
+        threading.Thread(target=_run_pending_join_now, daemon=True).start()
     else:
-        # No restart needed: federation is already active in the running Synapse.
-        # Mark Synapse ready now and complete the join in the background so the
-        # response returns immediately; the page polls status and forwards once
-        # the join lands. This avoids the fragile restart entirely on the common
-        # path.
-        _update_settings(community_synapse_ready=True)
-        if want_join:
-            threading.Thread(target=_run_pending_join_now, daemon=True).start()
-        else:
-            _update_settings(community_join_pending=False)
+        _update_settings(community_join_pending=False)
 
     # JS path: return JSON so the page's fetch handler starts polling. Non-JS
     # fallback: re-render this same screen in the saving state (self-polls).
