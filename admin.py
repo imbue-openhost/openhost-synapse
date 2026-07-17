@@ -1020,7 +1020,7 @@ def _community_landing_path(settings: dict) -> str:
 SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Signing in...</title></head>
 <body style="background:#0f1117;color:#e2e8f0;font-family:sans-serif;text-align:center;padding-top:20vh">
-<p id="msg">Signing you in to community chat...</p>
+<p id="msg">Signing you in to OpenHost Community Chat...</p>
 <script>
 (function () {
   var token = {{ access_token|tojson }};
@@ -1071,7 +1071,7 @@ SSO_BOOTSTRAP_TEMPLATE = """<!DOCTYPE html>
 ONBOARDING_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Set up chat</title>
+<title>Set up OpenHost Community Chat</title>
 <style>
   *,*::before,*::after{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
@@ -1097,7 +1097,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
   @keyframes spin{to{transform:rotate(360deg)}}
 </style></head>
 <body><div class="container">
-  <h1>Set up chat</h1>
+  <h1>Set up OpenHost Community Chat</h1>
   <p class="subtitle">Choose a username, then open chat.
      <a href="/_openhost/community/help" style="color:#a5b4fc">Learn more</a>.</p>
 
@@ -1264,7 +1264,7 @@ ONBOARDING_TEMPLATE = """<!DOCTYPE html>
 HELP_TEMPLATE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Community Chat: help</title>
+<title>OpenHost Community Chat: help</title>
 <style>
   *,*::before,*::after{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1117;color:#e2e8f0;margin:0;padding:2rem;min-height:100vh}
@@ -1277,7 +1277,7 @@ HELP_TEMPLATE = """<!DOCTYPE html>
   a.back{display:inline-block;margin-top:1.5rem;color:#a5b4fc}
 </style></head>
 <body><div class="container">
-  <h1>Community Chat</h1>
+  <h1>OpenHost Community Chat</h1>
   <p>This runs a private Matrix homeserver on your instance with a built-in web
      chat client. You sign in to it automatically as your account.</p>
 
