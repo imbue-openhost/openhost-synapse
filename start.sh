@@ -324,10 +324,14 @@ PYEOF
     #     otherwise land on Cinny's own (dead-end, custom-homeservers-disabled)
     #     login screen.
     #   * Has a session AND on "/" -> ask the app where to land and, if that's the
-    #     community space (not "/"), redirect there so a RETURNING visit opens
-    #     onto the space lobby instead of Cinny's empty Home view. A one-shot
-    #     sessionStorage flag stops it re-redirecting if the user later navigates
-    #     back to "/" on purpose within the same tab session.
+    #     community space (not "/"), redirect there so opening the app (e.g. via
+    #     the OpenHost dashboard link) lands onto the space lobby instead of
+    #     Cinny's empty Home view. This fires on every full-page load of "/", not
+    #     just the first: the guard script only runs on a real document load, and
+    #     Cinny's in-app navigation to Home is a client-side history push that
+    #     does NOT re-execute this script. So there is no "user deliberately went
+    #     Home" case to protect here -- a fresh load of "/" always means the app
+    #     was (re)opened, which is exactly when we want to land on the space.
     # The guard only ever runs inside this served index.html; the SSO endpoint
     # (/_openhost/*) and the Matrix APIs (/_matrix, /_synapse) are handled by
     # Caddy before the SPA, so redirecting to /_openhost/community/login cannot
@@ -340,7 +344,7 @@ PYEOF
     # on its own login screen, so we treat that as "no session" and route through
     # SSO, which repopulates all of them.
     if [ -f "$WEBROOT/index.html" ] && ! grep -q "openhost-firstrun-guard" "$WEBROOT/index.html"; then
-        GUARD='<script id="openhost-firstrun-guard">(function(){var ls=window.localStorage;if(!ls.getItem("cinny_access_token")||!ls.getItem("cinny_device_id")||!ls.getItem("cinny_hs_base_url")){location.replace("/_openhost/community/login");return;}if(location.pathname!=="/")return;if(sessionStorage.getItem("oh_landed"))return;var x=new XMLHttpRequest();x.open("GET","/_openhost/community/landing",false);try{x.send(null);if(x.status===200){var p=JSON.parse(x.responseText).path;if(p&&p!=="/"){sessionStorage.setItem("oh_landed","1");location.replace(p);}}}catch(e){}})();</script>'
+        GUARD='<script id="openhost-firstrun-guard">(function(){var ls=window.localStorage;if(!ls.getItem("cinny_access_token")||!ls.getItem("cinny_device_id")||!ls.getItem("cinny_hs_base_url")){location.replace("/_openhost/community/login");return;}if(location.pathname!=="/")return;var x=new XMLHttpRequest();x.open("GET","/_openhost/community/landing",false);try{x.send(null);if(x.status===200){var p=JSON.parse(x.responseText).path;if(p&&p!=="/"){location.replace(p);}}}catch(e){}})();</script>'
         # Insert right after <head> so it runs before Cinny boots.
         python3 - "$WEBROOT/index.html" "$GUARD" <<'PYEOF'
 import sys
