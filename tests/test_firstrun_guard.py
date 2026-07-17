@@ -51,6 +51,7 @@ def run_guard(
     token: str | None = None,
     landing_path: str = "/",
     session: dict | None = None,
+    preseed_session_storage: dict | None = None,
 ) -> str | None:
     """Execute the guard JS in Node with a stubbed browser environment and return
     the URL it redirected to (via location.replace), or None if it did not.
@@ -60,6 +61,11 @@ def run_guard(
     ``None`` token seeds an empty localStorage. Pass ``session`` explicitly to
     test partial/corrupt states.
 
+    ``preseed_session_storage`` seeds sessionStorage before the guard runs, used
+    to simulate a repeat full-page load in the same tab (where sessionStorage
+    survives). The guard must not depend on sessionStorage for its redirect
+    decision.
+
     Stubs window.localStorage, location, sessionStorage, and a synchronous
     XMLHttpRequest (returning ``{"path": landing_path}``) so both the SSO-redirect
     and the "/"-landing branches can be exercised.
@@ -67,6 +73,7 @@ def run_guard(
     if session is None:
         session = dict(FULL_SESSION) if token else {}
     ls_json = repr(json.dumps(session))
+    ss_json = repr(json.dumps(preseed_session_storage or {}))
     harness = f"""
     let redirectedTo = null;
     const localStorage = {{
@@ -74,7 +81,7 @@ def run_guard(
       getItem(k) {{ return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; }},
     }};
     const sessionStorage = {{
-      _d: {{}},
+      _d: JSON.parse({ss_json}),
       getItem(k) {{ return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; }},
       setItem(k, v) {{ this._d[k] = String(v); }},
       removeItem(k) {{ delete this._d[k]; }},
@@ -143,6 +150,20 @@ class TestGuardBehavior(unittest.TestCase):
         # lobby (from the landing endpoint), not Cinny's Home.
         space = "/%21abc%3Amatrix.openhost.imbue.com/lobby/"
         self.assertEqual(run_guard("/", "syt_sometoken", landing_path=space), space)
+
+    def test_session_on_root_lands_on_space_on_every_load(self):
+        # Regression: opening the app on "/" must redirect to the space on EVERY
+        # full-page load, not just the first one in a tab. A prior design gated
+        # this on a one-shot sessionStorage flag ("oh_landed"), which meant that
+        # reopening the app in the same tab (e.g. clicking the OpenHost dashboard
+        # link again) skipped the redirect and dead-ended on Cinny's Home view.
+        # Seed sessionStorage as if a previous load had already run and confirm we
+        # still redirect to the space.
+        space = "/%21abc%3Amatrix.openhost.imbue.com/lobby/"
+        landed = run_guard(
+            "/", "syt_sometoken", landing_path=space, preseed_session_storage={"oh_landed": "1"}
+        )
+        self.assertEqual(landed, space)
 
     def test_session_on_root_no_space_stays(self):
         # If the landing endpoint says "/" (no joined space), don't redirect.
