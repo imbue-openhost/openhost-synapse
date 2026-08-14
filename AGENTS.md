@@ -1,4 +1,4 @@
-# Design notes for openhost-community-chat
+# Design notes for bottled-community-chat
 
 Durable, project-level decisions. Keep these in mind for future changes.
 
