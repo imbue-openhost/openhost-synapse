@@ -77,7 +77,7 @@ Implementation notes:
 ## How it works
 
 On first boot, the container:
-1. Generates a `homeserver.yaml` config with the server name derived from OpenHost environment variables (`<app_name>.<zone_domain>`, e.g. `openhost-community-chat.andrew.host.imbue.com`)
+1. Generates a `homeserver.yaml` config with the server name derived from OpenHost environment variables (`<app_name>.<zone_domain>`, e.g. `bottle-community-chat.andrew.host.imbue.com`)
 2. Generates signing keys
 3. Creates `openhost_settings.json` with default settings (federation enabled, open registration enabled)
 4. Applies settings from `openhost_settings.json` to `homeserver.yaml`
@@ -89,7 +89,7 @@ On subsequent boots, `start.sh` patches `public_baseurl` and `media_store_path` 
 
 ## Admin UI
 
-The chat account, federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://openhost-community-chat.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
+The chat account, federation and registration are managed via the admin UI at `/_openhost/admin` (e.g. `https://bottle-community-chat.andrew.host.imbue.com/_openhost/admin`). This page is only accessible to authenticated OpenHost users (zone auth gates it).
 
 The UI provides:
 
@@ -117,7 +117,7 @@ this app restarts itself:
   `homeserver.yaml` / the Caddyfile from the saved settings on the fresh boot.
  - The admin UI and onboarding pages poll for the app coming back up and continue
    automatically, so the user never has to touch the OpenHost dashboard. Onboarding
-   stays on the same "Set up OpenHost Community Chat" screen while it restarts (submit is replaced by a
+   stays on the same "Set up Cloud in a Bottle Community Chat" screen while it restarts (submit is replaced by a
    spinner); it polls the onboarding status endpoint and forwards to chat once the
    app is back, with no separate transitional page.
  - When the owner opts into the community space, onboarding blocks the spinner
@@ -157,12 +157,12 @@ The first user to register can be promoted to admin via the Synapse admin API or
 Deploy via the OpenHost dashboard or CLI:
 
 ```bash
-oh app deploy https://github.com/imbue-openhost/openhost-community-chat --wait
+oh app deploy https://github.com/cloud-in-a-bottle/bottled-community-chat --wait
 ```
 
-The app will be available at `openhost-community-chat.<zone_domain>` (e.g. `openhost-community-chat.andrew.host.imbue.com`).
+The app will be available at `bottle-community-chat.<zone_domain>` (e.g. `bottle-community-chat.andrew.host.imbue.com`).
 
-Connect with any Matrix client (Element, FluffyChat, etc.) using your server URL as the homeserver. User IDs will look like `@user:openhost-community-chat.<zone_domain>`.
+Connect with any Matrix client (Element, FluffyChat, etc.) using your server URL as the homeserver. User IDs will look like `@user:bottle-community-chat.<zone_domain>`.
 
 ## Data
 

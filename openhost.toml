@@ -1,5 +1,5 @@
 [app]
-name = "openhost-community-chat"
+name = "bottle-community-chat"
 version = "0.1.0"
 description = "Cloud in a Bottle Community Chat: Matrix Synapse homeserver with a bundled web client, owner SSO, and one-click community-space join"
 
