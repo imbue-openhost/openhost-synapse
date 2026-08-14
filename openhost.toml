@@ -1,7 +1,7 @@
 [app]
 name = "openhost-community-chat"
 version = "0.1.0"
-description = "OpenHost Community Chat: Matrix Synapse homeserver with a bundled web client, owner SSO, and one-click community-space join"
+description = "Cloud in a Bottle Community Chat: Matrix Synapse homeserver with a bundled web client, owner SSO, and one-click community-space join"
 
 [runtime.container]
 image = "Dockerfile"
