@@ -20,7 +20,7 @@ path = "/_openhost/admin"
 
 [resources]
 memory_mb = 2048
-cpu_millicores = 2000
+cpu_cores = 2.0
 
 [data]
 app_data = true
